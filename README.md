@@ -1,9 +1,10 @@
 # AnchorDB
 
 AnchorDB is a lightweight Go service for automated database backups.
-
 > [!WARNING]
 > AnchorDB is still in active development and is not ready for production use.
+
+<img width="1920" height="1032" alt="Screenshot 2026-03-20 173241" src="https://github.com/user-attachments/assets/774e1c0d-3dcb-4aa9-853e-369fdf49f377" />
 
 ## Features
 
