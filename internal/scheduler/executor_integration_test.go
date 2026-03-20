@@ -310,7 +310,7 @@ func installFakeNpxCommand(t *testing.T, output string) string {
 	}
 
 	path := filepath.Join(dir, "npx")
-	content := "#!/bin/sh\nout=\"$4\"\nif [ -z \"$out\" ]; then\n  exit 1\nfi\nprintf '%s\n' \"" + output + "\" > \"$out\"\n"
+	content := "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--path\" ]; then\n    shift\n    out=\"$1\"\n    break\n  fi\n  shift\ndone\nif [ -z \"$out\" ]; then\n  exit 1\nfi\nprintf '%s\n' \"" + output + "\" > \"$out\"\n"
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatalf("write fake unix npx command: %v", err)
 	}
