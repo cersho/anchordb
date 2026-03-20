@@ -11,6 +11,11 @@ type Config struct {
 	MetadataDriver       string
 	MetadataURL          string
 	SecretKey            string
+	CloudflareAccountID  string
+	CloudflareDatabaseID string
+	CloudflareAPIKey     string
+	D1ExportLimit        int
+	D1APIBaseURL         string
 	MaxConcurrentBackups int
 	BackupCommandTimeout time.Duration
 	DefaultLocalBasePath string
@@ -22,6 +27,11 @@ func Load() Config {
 		MetadataDriver:       getenv("METADATA_DRIVER", "sqlite"),
 		MetadataURL:          getenv("METADATA_DB_URL", "anchordb.db"),
 		SecretKey:            getenv("SECRET_KEY", "anchordb-dev-secret"),
+		CloudflareAccountID:  getenv("CLOUDFLARE_ACCOUNT_ID", ""),
+		CloudflareDatabaseID: getenv("CLOUDFLARE_DATABASE_ID", ""),
+		CloudflareAPIKey:     getenv("CLOUDFLARE_API_KEY", ""),
+		D1ExportLimit:        getenvInt("D1_EXPORT_LIMIT", 1000),
+		D1APIBaseURL:         getenv("D1_API_BASE_URL", "https://api.cloudflare.com/client/v4"),
 		MaxConcurrentBackups: getenvInt("MAX_CONCURRENT_BACKUPS", 2),
 		BackupCommandTimeout: getenvDuration("BACKUP_COMMAND_TIMEOUT", 2*time.Hour),
 		DefaultLocalBasePath: getenv("DEFAULT_LOCAL_BACKUP_PATH", "./backups"),

@@ -65,6 +65,9 @@ func NewHandler(repo *repository.Repository, scheduler *scheduler.Scheduler, cfg
 			if strings.EqualFold(c.Type, "convex") {
 				return c.Host
 			}
+			if strings.EqualFold(c.Type, "d1") {
+				return c.Host
+			}
 			return c.Host + ":" + strconv.Itoa(c.Port)
 		},
 		"runTone": func(status string) string {
@@ -415,18 +418,23 @@ func (h *Handler) createConnection(w http.ResponseWriter, r *http.Request) {
 		h.renderConnections(w, "", "name, type, host, and password are required")
 		return
 	}
-	if item.Type != "postgres" && item.Type != "postgresql" && item.Type != "mysql" && item.Type != "convex" {
-		h.renderConnections(w, "", "type must be mysql, postgres, or convex")
+	if item.Type != "postgres" && item.Type != "postgresql" && item.Type != "mysql" && item.Type != "convex" && item.Type != "d1" {
+		h.renderConnections(w, "", "type must be mysql, postgres, convex, or d1")
 		return
 	}
-	if item.Type != "convex" && (item.Database == "" || item.Username == "") {
+	if item.Type == "d1" && item.Database == "" {
+		h.renderConnections(w, "", "database is required for d1")
+		return
+	}
+	if item.Type != "convex" && item.Type != "d1" && (item.Database == "" || item.Username == "") {
 		h.renderConnections(w, "", "database and username are required for mysql/postgres")
 		return
 	}
 	if item.Port == 0 {
-		if item.Type == "postgres" || item.Type == "postgresql" {
+		switch item.Type {
+		case "postgres", "postgresql":
 			item.Port = 5432
-		} else if item.Type == "mysql" {
+		case "mysql":
 			item.Port = 3306
 		}
 	}
@@ -437,6 +445,13 @@ func (h *Handler) createConnection(w http.ResponseWriter, r *http.Request) {
 		if item.Username == "" {
 			item.Username = "convex"
 		}
+		item.SSLMode = ""
+	}
+	if item.Type == "d1" {
+		if item.Username == "" {
+			item.Username = "d1"
+		}
+		item.Port = 0
 		item.SSLMode = ""
 	}
 

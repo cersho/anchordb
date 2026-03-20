@@ -87,6 +87,13 @@ func (h *Handler) createConnection(w http.ResponseWriter, r *http.Request) {
 		}
 		req.SSLMode = ""
 	}
+	if req.Type == "d1" {
+		if strings.TrimSpace(req.Username) == "" {
+			req.Username = "d1"
+		}
+		req.Port = 0
+		req.SSLMode = ""
+	}
 
 	if err := h.repo.CreateConnection(r.Context(), &req); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -134,7 +141,7 @@ func (h *Handler) updateConnection(w http.ResponseWriter, r *http.Request) {
 	if req.Type != "" {
 		req.Type = strings.ToLower(req.Type)
 		if !validConnectionType(req.Type) {
-			writeError(w, http.StatusBadRequest, "type must be mysql, postgres, or convex")
+			writeError(w, http.StatusBadRequest, "type must be mysql, postgres, convex, or d1")
 			return
 		}
 	}
@@ -506,9 +513,12 @@ func validateConnectionCreate(c models.Connection) error {
 	}
 	c.Type = strings.ToLower(c.Type)
 	if !validConnectionType(c.Type) {
-		return errors.New("type must be mysql, postgres, or convex")
+		return errors.New("type must be mysql, postgres, convex, or d1")
 	}
-	if c.Type != "convex" && (c.Database == "" || c.Username == "") {
+	if c.Type == "d1" && c.Database == "" {
+		return errors.New("database is required for d1")
+	}
+	if c.Type != "convex" && c.Type != "d1" && (c.Database == "" || c.Username == "") {
 		return errors.New("database and username are required for mysql/postgres")
 	}
 	if c.Port < 0 || c.Port > 65535 {
@@ -528,7 +538,7 @@ func validateRemoteCreate(rem models.Remote) error {
 }
 
 func validConnectionType(t string) bool {
-	return t == "postgres" || t == "postgresql" || t == "mysql" || t == "convex"
+	return t == "postgres" || t == "postgresql" || t == "mysql" || t == "convex" || t == "d1"
 }
 
 func defaultPort(t string) int {
@@ -536,6 +546,9 @@ func defaultPort(t string) int {
 		return 5432
 	}
 	if t == "convex" {
+		return 0
+	}
+	if t == "d1" {
 		return 0
 	}
 	return 3306

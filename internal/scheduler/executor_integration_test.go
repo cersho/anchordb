@@ -3,7 +3,10 @@ package scheduler_test
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -161,6 +164,112 @@ func TestExecutorRunStoresConvexExportArchive(t *testing.T) {
 	if !strings.Contains(string(body), "convex-export") {
 		t.Fatalf("unexpected convex export content: %q", string(body))
 	}
+}
+
+func TestExecutorRunStoresD1ExportSQL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+
+		var payload struct {
+			SQL string `json:"sql"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode d1 request: %v", err)
+		}
+
+		sql := payload.SQL
+		switch {
+		case strings.Contains(sql, "type = 'table' ORDER BY rootpage DESC"):
+			writeD1Response(w, []map[string]any{{
+				"name": "users",
+				"type": "table",
+				"sql":  "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+			}})
+		case strings.Contains(sql, "SELECT * FROM \"users\" LIMIT 1"):
+			writeD1Response(w, []map[string]any{{"id": 1, "name": "alpha"}})
+		case strings.Contains(sql, "SELECT COUNT(*) AS count FROM \"users\""):
+			writeD1Response(w, []map[string]any{{"count": 1}})
+		case strings.Contains(sql, "AS partial_command"):
+			if strings.Contains(sql, "OFFSET 0") {
+				writeD1Response(w, []map[string]any{{"partial_command": "1, 'alpha'"}})
+				return
+			}
+			writeD1Response(w, []map[string]any{})
+		case strings.Contains(sql, "type IN ('index', 'trigger', 'view')"):
+			writeD1Response(w, []map[string]any{})
+		default:
+			t.Fatalf("unexpected d1 sql: %s", sql)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	root := t.TempDir()
+	exec := scheduler.NewExecutor(config.Config{
+		BackupCommandTimeout: 5 * time.Second,
+		DefaultLocalBasePath: root,
+		D1APIBaseURL:         server.URL,
+	})
+
+	backup := models.Backup{
+		ID:          "backup-d1",
+		TargetType:  "local",
+		Compression: "gzip",
+		Connection: models.Connection{
+			Name:     "D1 Main",
+			Type:     "d1",
+			Host:     "account-123",
+			Database: "database-456",
+			Password: "token",
+		},
+	}
+
+	key, err := exec.Run(context.Background(), backup)
+	if err != nil {
+		t.Fatalf("run d1 executor: %v", err)
+	}
+
+	if !strings.HasSuffix(key, ".sql.gz") {
+		t.Fatalf("expected gzip sql artifact key, got %q", key)
+	}
+
+	file, err := os.Open(filepath.Join(root, filepath.FromSlash(key)))
+	if err != nil {
+		t.Fatalf("open d1 backup artifact: %v", err)
+	}
+	defer func() { _ = file.Close() }()
+
+	gz, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatalf("open d1 gzip stream: %v", err)
+	}
+	defer func() { _ = gz.Close() }()
+
+	body, err := io.ReadAll(gz)
+	if err != nil {
+		t.Fatalf("read d1 gzip content: %v", err)
+	}
+
+	content := string(body)
+	if !strings.Contains(content, "CREATE TABLE IF NOT EXISTS users") {
+		t.Fatalf("expected create table statement, got %q", content)
+	}
+	if !strings.Contains(content, "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, 'alpha');") {
+		t.Fatalf("expected insert statement, got %q", content)
+	}
+}
+
+func writeD1Response(w http.ResponseWriter, rows []map[string]any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success": true,
+		"errors":  []any{},
+		"result": []map[string]any{{
+			"success": true,
+			"results": rows,
+		}},
+	})
 }
 
 func installFakeCommand(t *testing.T, name, output string) string {

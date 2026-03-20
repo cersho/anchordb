@@ -291,22 +291,40 @@
         var typeSelect = form.querySelector("select[name='type']");
         if (!typeSelect) return;
 
-        var isConvex = (typeSelect.value || "").toLowerCase() === "convex";
+        var selectedType = (typeSelect.value || "").toLowerCase();
+        var isConvex = selectedType === "convex";
+        var isD1 = selectedType === "d1";
+        var isSQL = selectedType === "postgres" || selectedType === "postgresql" || selectedType === "mysql";
         var hostLabel = document.getElementById("connection-host-label");
         var hostInput = document.getElementById("connection-host-input");
         var passwordLabel = document.getElementById("connection-password-label");
+        var databaseLabel = document.getElementById("connection-database-label");
 
-        if (hostLabel) hostLabel.textContent = isConvex ? "Convex URL" : "Host";
-        if (hostInput) hostInput.placeholder = isConvex ? "https://your-convex" : "localhost";
-        if (passwordLabel) passwordLabel.textContent = isConvex ? "Admin Key" : "Password";
+        if (hostLabel) hostLabel.textContent = isConvex ? "Convex URL" : (isD1 ? "Cloudflare Account ID" : "Host");
+        if (hostInput) hostInput.placeholder = isConvex ? "https://your-convex" : (isD1 ? "CLOUDFLARE_ACCOUNT_ID" : "localhost");
+        if (passwordLabel) passwordLabel.textContent = isConvex ? "Admin Key" : (isD1 ? "Cloudflare API Token" : "Password");
+        if (databaseLabel) databaseLabel.textContent = isD1 ? "Cloudflare Database ID" : "Database";
 
         form.querySelectorAll(".conn-sql-only").forEach(function (section) {
+          section.style.display = isSQL ? "" : "none";
+          section.querySelectorAll("input, select").forEach(function (field) {
+            field.disabled = !isSQL;
+          });
+        });
+
+        form.querySelectorAll(".conn-db-required").forEach(function (section) {
           section.style.display = isConvex ? "none" : "";
           section.querySelectorAll("input, select").forEach(function (field) {
             field.disabled = isConvex;
-            if (field.name === "database" || field.name === "username") {
-              field.required = !isConvex;
-            }
+            field.required = !isConvex;
+          });
+        });
+
+        form.querySelectorAll(".conn-username-sql-only").forEach(function (section) {
+          section.style.display = isSQL ? "" : "none";
+          section.querySelectorAll("input, select").forEach(function (field) {
+            field.disabled = !isSQL;
+            field.required = isSQL;
           });
         });
       }
@@ -422,11 +440,11 @@
         <div class="dialog-head"><h3>New connection</h3><button type="button" class="btn alt" data-dialog-close>Close</button></div>
         <form id="connection-form" class="grid-3" hx-post="/app/connections" hx-target="#connections-section" hx-swap="outerHTML">
           <div><label>Name</label><input name="name" required></div>
-          <div><label>Type</label><select name="type"><option value="postgres">postgres</option><option value="mysql">mysql</option><option value="convex">convex</option></select></div>
+          <div><label>Type</label><select name="type"><option value="postgres">postgres</option><option value="mysql">mysql</option><option value="convex">convex</option><option value="d1">d1</option></select></div>
           <div><label id="connection-host-label">Host</label><input id="connection-host-input" name="host" placeholder="localhost" required></div>
           <div class="conn-sql-only"><label>Port</label><input name="port" placeholder="5432"></div>
-          <div class="conn-sql-only"><label>Database</label><input name="database" required></div>
-          <div class="conn-sql-only"><label>Username</label><input name="username" required></div>
+          <div class="conn-db-required"><label id="connection-database-label">Database</label><input name="database" required></div>
+          <div class="conn-username-sql-only"><label>Username</label><input name="username" required></div>
           <div><label id="connection-password-label">Password</label><input name="password" type="password" required></div>
           <div class="conn-sql-only"><label>SSL Mode</label><input name="ssl_mode" placeholder="disable"></div>
           <div class="full"><button type="submit">Create connection</button></div>

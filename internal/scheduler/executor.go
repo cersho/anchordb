@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +41,9 @@ func (e *Executor) Run(ctx context.Context, b models.Backup) (string, error) {
 	defer cancel()
 	if strings.EqualFold(b.Connection.Type, "convex") {
 		return e.runConvexExport(runCtx, b)
+	}
+	if strings.EqualFold(b.Connection.Type, "d1") {
+		return e.runD1Export(runCtx, b)
 	}
 
 	cmd, stdout, err := buildDumpCommand(runCtx, b.Connection)
@@ -149,6 +156,323 @@ func (e *Executor) runConvexExport(ctx context.Context, b models.Backup) (string
 	}
 
 	return key, nil
+}
+
+func (e *Executor) runD1Export(ctx context.Context, b models.Backup) (string, error) {
+	accountID := strings.TrimSpace(b.Connection.Host)
+	if accountID == "" {
+		accountID = strings.TrimSpace(e.cfg.CloudflareAccountID)
+	}
+	databaseID := strings.TrimSpace(b.Connection.Database)
+	if databaseID == "" {
+		databaseID = strings.TrimSpace(e.cfg.CloudflareDatabaseID)
+	}
+	apiKey := strings.TrimSpace(b.Connection.Password)
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(e.cfg.CloudflareAPIKey)
+	}
+
+	if accountID == "" || databaseID == "" || apiKey == "" {
+		return "", fmt.Errorf("d1 export requires account id, database id, and api key")
+	}
+
+	limit := e.cfg.D1ExportLimit
+	if limit <= 0 {
+		limit = 1000
+	}
+
+	sqlBackup, err := e.buildD1SQLBackup(ctx, accountID, databaseID, apiKey, limit)
+	if err != nil {
+		return "", err
+	}
+
+	reader, closeReader, err := wrapCompression(io.NopCloser(strings.NewReader(sqlBackup)), b.Compression)
+	if err != nil {
+		return "", err
+	}
+	defer closeReader()
+
+	key := buildObjectKey(b)
+	switch b.TargetType {
+	case "local":
+		err = e.saveLocal(b.LocalPath, key, reader)
+	case "s3":
+		if b.Remote == nil {
+			err = fmt.Errorf("backup target s3 requires remote")
+		} else {
+			err = e.saveS3(ctx, *b.Remote, key, reader)
+		}
+	default:
+		err = fmt.Errorf("unsupported target_type: %s", b.TargetType)
+	}
+	if err != nil {
+		return "", fmt.Errorf("store backup: %w", err)
+	}
+
+	return key, nil
+}
+
+func (e *Executor) buildD1SQLBackup(ctx context.Context, accountID, databaseID, apiKey string, limit int) (string, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+
+	lines := make([]string, 0, 128)
+	appendLine := func(command string) {
+		lines = append(lines, command)
+	}
+
+	writableSchema := false
+
+	tables, err := e.d1QueryRows(ctx, accountID, databaseID, apiKey,
+		"SELECT name, type, sql FROM sqlite_master WHERE sql IS NOT NULL AND type = 'table' ORDER BY rootpage DESC")
+	if err != nil {
+		return "", err
+	}
+
+	for _, table := range tables {
+		tableName, _ := table["name"].(string)
+		tableSQL, _ := table["sql"].(string)
+		if tableName == "" {
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(tableName, "_cf_"):
+			continue
+		case tableName == "sqlite_sequence":
+			appendLine("DELETE FROM sqlite_sequence;")
+			continue
+		case tableName == "sqlite_stat1":
+			appendLine("ANALYZE sqlite_master;")
+			continue
+		case strings.HasPrefix(tableName, "sqlite_"):
+			continue
+		}
+
+		upperSQL := strings.ToUpper(tableSQL)
+		switch {
+		case strings.HasPrefix(upperSQL, "CREATE VIRTUAL TABLE"):
+			if !writableSchema {
+				appendLine("PRAGMA writable_schema=ON;")
+				writableSchema = true
+			}
+			escapedName := strings.ReplaceAll(tableName, "'", "''")
+			escapedSQL := strings.ReplaceAll(tableSQL, "'", "''")
+			appendLine(fmt.Sprintf("INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES ('table', '%s', '%s', 0, '%s');", escapedName, escapedName, escapedSQL))
+		case strings.HasPrefix(upperSQL, "CREATE TABLE "):
+			appendLine("CREATE TABLE IF NOT EXISTS " + tableSQL[len("CREATE TABLE "):] + ";")
+		default:
+			appendLine(tableSQL + ";")
+		}
+
+		quotedTableName := d1QuoteIdentifier(tableName)
+		sampleRows, sampleErr := e.d1QueryRows(ctx, accountID, databaseID, apiKey, fmt.Sprintf("SELECT * FROM %s LIMIT 1", quotedTableName))
+		if sampleErr != nil {
+			return "", sampleErr
+		}
+		if len(sampleRows) == 0 {
+			continue
+		}
+
+		columnNames := make([]string, 0, len(sampleRows[0]))
+		for name := range sampleRows[0] {
+			columnNames = append(columnNames, name)
+		}
+		sort.Strings(columnNames)
+
+		countRows, countErr := e.d1QueryRows(ctx, accountID, databaseID, apiKey, fmt.Sprintf("SELECT COUNT(*) AS count FROM %s", quotedTableName))
+		if countErr != nil {
+			return "", countErr
+		}
+		if len(countRows) == 0 {
+			continue
+		}
+		count, convErr := d1ToInt(countRows[0]["count"])
+		if convErr != nil {
+			return "", fmt.Errorf("parse table row count for %s: %w", tableName, convErr)
+		}
+
+		for offset := 0; offset <= count; offset += limit {
+			queries := make([]string, 0, (len(columnNames)+8)/9)
+			for idx := 0; idx < len(columnNames); idx += 9 {
+				current := columnNames[idx:min(idx+9, len(columnNames))]
+				exprParts := make([]string, 0, len(current))
+				for _, colName := range current {
+					exprParts = append(exprParts, "'||quote("+d1QuoteIdentifier(colName)+")||'")
+				}
+				expr := "'" + strings.Join(exprParts, ", ") + "'"
+				queries = append(queries, fmt.Sprintf("SELECT %s AS partial_command FROM %s LIMIT %d OFFSET %d", expr, quotedTableName, limit, offset))
+			}
+
+			batch, batchErr := e.d1Query(ctx, accountID, databaseID, apiKey, strings.Join(queries, ";\n"))
+			if batchErr != nil {
+				return "", batchErr
+			}
+			if len(batch) == 0 || len(batch[0].Results) == 0 {
+				continue
+			}
+
+			baseRows := len(batch[0].Results)
+			for i := 1; i < len(batch); i++ {
+				if len(batch[i].Results) != baseRows {
+					return "", fmt.Errorf("d1 multi-query split mismatch for table %s", tableName)
+				}
+			}
+
+			quotedColumns := make([]string, 0, len(columnNames))
+			for _, colName := range columnNames {
+				quotedColumns = append(quotedColumns, d1QuoteIdentifier(colName))
+			}
+
+			for rowIdx := 0; rowIdx < baseRows; rowIdx++ {
+				parts := make([]string, 0, len(batch))
+				for resultIdx := range batch {
+					part, _ := batch[resultIdx].Results[rowIdx]["partial_command"].(string)
+					parts = append(parts, strings.ReplaceAll(part, "\n", "\\n"))
+				}
+				appendLine(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s);", quotedTableName, strings.Join(quotedColumns, ", "), strings.Join(parts, ", ")))
+			}
+		}
+	}
+
+	schemas, err := e.d1QueryRows(ctx, accountID, databaseID, apiKey,
+		"SELECT name, type, sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('index', 'trigger', 'view')")
+	if err != nil {
+		return "", err
+	}
+	for _, schema := range schemas {
+		schemaSQL, _ := schema["sql"].(string)
+		if strings.TrimSpace(schemaSQL) == "" {
+			continue
+		}
+		appendLine(schemaSQL + ";")
+	}
+
+	if writableSchema {
+		appendLine("PRAGMA writable_schema=OFF;")
+	}
+
+	return strings.Join(lines, "\n"), nil
+}
+
+type d1QueryEnvelope struct {
+	Success bool            `json:"success"`
+	Errors  []d1ErrorObject `json:"errors"`
+	Result  []d1QueryResult `json:"result"`
+}
+
+type d1ErrorObject struct {
+	Message string `json:"message"`
+}
+
+type d1QueryResult struct {
+	Success bool             `json:"success"`
+	Results []map[string]any `json:"results"`
+}
+
+func (e *Executor) d1Query(ctx context.Context, accountID, databaseID, apiKey, sql string) ([]d1QueryResult, error) {
+	endpoint := strings.TrimSuffix(strings.TrimSpace(e.cfg.D1APIBaseURL), "/")
+	if endpoint == "" {
+		endpoint = "https://api.cloudflare.com/client/v4"
+	}
+	endpoint = endpoint + "/accounts/" + accountID + "/d1/database/" + databaseID + "/query"
+
+	payload, err := json.Marshal(map[string]any{"sql": sql})
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var envelope d1QueryEnvelope
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		if res.StatusCode >= http.StatusBadRequest {
+			return nil, fmt.Errorf("d1 query failed (status %d): %s", res.StatusCode, strings.TrimSpace(string(body)))
+		}
+		return nil, fmt.Errorf("decode d1 response: %w", err)
+	}
+
+	if res.StatusCode >= http.StatusBadRequest {
+		if len(envelope.Errors) > 0 {
+			messages := make([]string, 0, len(envelope.Errors))
+			for _, item := range envelope.Errors {
+				if strings.TrimSpace(item.Message) != "" {
+					messages = append(messages, item.Message)
+				}
+			}
+			return nil, fmt.Errorf("d1 query failed: %s", strings.Join(messages, "; "))
+		}
+		return nil, fmt.Errorf("d1 query failed (status %d)", res.StatusCode)
+	}
+
+	if len(envelope.Errors) > 0 {
+		messages := make([]string, 0, len(envelope.Errors))
+		for _, item := range envelope.Errors {
+			if strings.TrimSpace(item.Message) != "" {
+				messages = append(messages, item.Message)
+			}
+		}
+		return nil, fmt.Errorf("d1 query error: %s", strings.Join(messages, "; "))
+	}
+
+	for _, result := range envelope.Result {
+		if !result.Success {
+			return nil, fmt.Errorf("d1 query returned unsuccessful result")
+		}
+	}
+
+	return envelope.Result, nil
+}
+
+func (e *Executor) d1QueryRows(ctx context.Context, accountID, databaseID, apiKey, sql string) ([]map[string]any, error) {
+	results, err := e.d1Query(ctx, accountID, databaseID, apiKey, sql)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	return results[0].Results, nil
+}
+
+func d1QuoteIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+func d1ToInt(value any) (int, error) {
+	switch v := value.(type) {
+	case float64:
+		return int(v), nil
+	case int:
+		return v, nil
+	case int64:
+		return int(v), nil
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0, err
+		}
+		return n, nil
+	default:
+		return 0, fmt.Errorf("unexpected type %T", value)
+	}
 }
 
 func (e *Executor) CleanupRetention(ctx context.Context, b models.Backup) error {

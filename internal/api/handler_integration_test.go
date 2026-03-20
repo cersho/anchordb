@@ -258,6 +258,40 @@ func TestCreateConvexBackupForcesNoCompression(t *testing.T) {
 	}
 }
 
+func TestCreateD1ConnectionWithMinimalFields(t *testing.T) {
+	stack := testutil.NewStack(t)
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	t.Cleanup(server.Close)
+
+	res := doJSON(t, http.MethodPost, server.URL+"/connections", map[string]any{
+		"name":     "d1-main",
+		"type":     "d1",
+		"host":     "account-123",
+		"database": "db-456",
+		"password": "api-token",
+	})
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", res.StatusCode)
+	}
+
+	var created models.Connection
+	decodeJSON(t, res.Body, &created)
+	if created.ID == "" {
+		t.Fatal("expected created d1 connection id")
+	}
+	if created.Type != "d1" {
+		t.Fatalf("expected d1 type, got %q", created.Type)
+	}
+	if created.Password != "" {
+		t.Fatalf("expected redacted password, got %q", created.Password)
+	}
+	if created.Port != 0 {
+		t.Fatalf("expected port 0 for d1, got %d", created.Port)
+	}
+}
+
 func doJSON(t *testing.T, method, url string, payload any) *http.Response {
 	t.Helper()
 

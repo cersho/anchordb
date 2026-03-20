@@ -118,3 +118,35 @@ func TestCreateConvexConnectionFromUI(t *testing.T) {
 		t.Fatalf("expected success message, got %q", string(body))
 	}
 }
+
+func TestCreateD1ConnectionFromUI(t *testing.T) {
+	stack := testutil.NewStack(t)
+	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)
+	server := httptest.NewServer(h.Router())
+	t.Cleanup(server.Close)
+
+	form := url.Values{}
+	form.Set("name", "d1-ui")
+	form.Set("type", "d1")
+	form.Set("host", "account-123")
+	form.Set("database", "db-456")
+	form.Set("password", "api-token")
+
+	res, err := http.PostForm(server.URL+"/connections", form)
+	if err != nil {
+		t.Fatalf("post d1 connection form: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if !strings.Contains(string(body), "Connection created") {
+		t.Fatalf("expected success message, got %q", string(body))
+	}
+}
