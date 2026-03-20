@@ -16,4 +16,4 @@ AnchorDB is a lightweight Go service for automated database backups.
 
 ## License
 
-This project is licensed under the Apache 2.0 License - see the `LICENSE` file for details.
+This project is licensed under the Apache 2.0 License - see the [License](https://github.com/cersho/anchordb/edit/main/LICENSE) file for details.
