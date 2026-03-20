@@ -1,16 +1,22 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"anchordb/internal/config"
 	"anchordb/internal/models"
@@ -41,8 +47,14 @@ type pageData struct {
 	Remotes          []models.Remote
 	Backups          []models.Backup
 	Runs             []models.BackupRun
+	RunItems         []runListItem
+	RunLog           []runLogLine
+	SelectedRunID    string
+	SelectedRun      runListItem
+	HasSelectedRun   bool
 	SelectedBackupID string
 	CurrentPage      string
+	Dashboard        dashboardStats
 
 	ConnectionsMsg string
 	ConnectionsErr string
@@ -53,6 +65,35 @@ type pageData struct {
 	RunsErr        string
 }
 
+type dashboardStats struct {
+	TotalConnections   int
+	HealthyConnections int
+	FailedConnections  int
+	TotalSchedules     int
+	EnabledSchedules   int
+	RunsLast30Days     int
+	SuccessRate        int
+	NextRunLabel       string
+}
+
+type runListItem struct {
+	ID             string
+	BackupID       string
+	BackupName     string
+	ConnectionName string
+	Status         string
+	ErrorText      string
+	OutputKey      string
+	StartedAt      time.Time
+	FinishedAt     *time.Time
+}
+
+type runLogLine struct {
+	Time    string
+	Level   string
+	Message string
+}
+
 func NewHandler(repo *repository.Repository, scheduler *scheduler.Scheduler, cfg config.Config) *Handler {
 	tmpl := template.Must(template.New("app").Funcs(template.FuncMap{
 		"isEnabled": func(v bool) string {
@@ -61,6 +102,8 @@ func NewHandler(repo *repository.Repository, scheduler *scheduler.Scheduler, cfg
 			}
 			return "disabled"
 		},
+		"typeLabel": connectionTypeLabel,
+		"dbIcon":    connectionTypeIconName,
 		"connectionAddress": func(c models.Connection) string {
 			if strings.EqualFold(c.Type, "convex") {
 				return c.Host
@@ -70,6 +113,8 @@ func NewHandler(repo *repository.Repository, scheduler *scheduler.Scheduler, cfg
 			}
 			return c.Host + ":" + strconv.Itoa(c.Port)
 		},
+		"ago":      ago,
+		"duration": runDuration,
 		"runTone": func(status string) string {
 			switch status {
 			case "success":
@@ -89,14 +134,20 @@ func (h *Handler) Router() http.Handler {
 	r := chi.NewRouter()
 
 	r.Get("/", h.home)
+	r.Get("/dashboard", h.dashboardPage)
 	r.Get("/connections", h.connectionsPage)
 	r.Get("/connections/section", h.connectionsSection)
 	r.Post("/connections", h.createConnection)
+	r.Post("/connections/test", h.testConnection)
+	r.Post("/connections/test-all", h.testAllConnections)
+	r.Post("/connections/{id}/test", h.testSavedConnection)
 	r.Get("/remotes", h.remotesPage)
 	r.Get("/remotes/section", h.remotesSection)
 	r.Post("/remotes", h.createRemote)
 	r.Get("/backups", h.backupsPage)
+	r.Get("/schedules", h.backupsPage)
 	r.Get("/backups/section", h.backupsSection)
+	r.Get("/schedules/section", h.backupsSection)
 	r.Post("/backups", h.createBackup)
 	r.Post("/backups/{id}/run", h.runBackupNow)
 	r.Post("/backups/{id}/toggle", h.toggleBackup)
@@ -110,7 +161,17 @@ func (h *Handler) Router() http.Handler {
 }
 
 func (h *Handler) home(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/app/connections", http.StatusFound)
+	http.Redirect(w, r, "/app/dashboard", http.StatusFound)
+}
+
+func (h *Handler) dashboardPage(w http.ResponseWriter, r *http.Request) {
+	data, err := h.loadDashboardData(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data.CurrentPage = "dashboard"
+	h.render(w, "page", data)
 }
 
 func (h *Handler) connectionsPage(w http.ResponseWriter, r *http.Request) {
@@ -159,7 +220,7 @@ func (h *Handler) backupsSection(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	data.CurrentPage = "backups"
+	data.CurrentPage = "schedules"
 	h.render(w, "backups_section", data)
 }
 
@@ -169,7 +230,7 @@ func (h *Handler) backupsPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	data.CurrentPage = "backups"
+	data.CurrentPage = "schedules"
 	h.render(w, "page", data)
 }
 
@@ -179,7 +240,7 @@ func (h *Handler) backupRuns(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) runsPage(w http.ResponseWriter, r *http.Request) {
-	data, err := h.loadRunsData(r.Context(), strings.TrimSpace(r.URL.Query().Get("backup_id")))
+	data, err := h.loadRunsData(r.Context(), strings.TrimSpace(r.URL.Query().Get("run_id")))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -189,7 +250,7 @@ func (h *Handler) runsPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) runsSection(w http.ResponseWriter, r *http.Request) {
-	data, err := h.loadRunsData(r.Context(), strings.TrimSpace(r.URL.Query().Get("backup_id")))
+	data, err := h.loadRunsData(r.Context(), strings.TrimSpace(r.URL.Query().Get("run_id")))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -197,33 +258,58 @@ func (h *Handler) runsSection(w http.ResponseWriter, r *http.Request) {
 	h.render(w, "runs_section", data)
 }
 
-func (h *Handler) loadRunsData(ctx context.Context, backupID string) (pageData, error) {
+func (h *Handler) loadRunsData(ctx context.Context, selectedRunID string) (pageData, error) {
 	backups, err := h.repo.ListBackups(ctx)
 	if err != nil {
 		return pageData{}, err
 	}
 	redactBackups(backups)
 
-	data := pageData{Backups: backups, SelectedBackupID: backupID}
-	if backupID == "" {
-		return data, nil
+	backupByID := make(map[string]models.Backup, len(backups))
+	for _, item := range backups {
+		backupByID[item.ID] = item
 	}
 
-	if _, err := h.repo.GetBackup(ctx, backupID); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			data.RunsErr = "Backup not found"
-			data.SelectedBackupID = ""
-			return data, nil
-		}
+	runs, err := h.repo.ListRecentRuns(ctx, 60)
+	if err != nil {
 		return pageData{}, err
 	}
 
-	items, err := h.repo.ListBackupRuns(ctx, backupID, 50)
-	if err != nil {
-		data.RunsErr = err.Error()
+	runItems := make([]runListItem, 0, len(runs))
+	for _, run := range runs {
+		backup := backupByID[run.BackupID]
+		runItems = append(runItems, runListItem{
+			ID:             run.ID,
+			BackupID:       run.BackupID,
+			BackupName:     backup.Name,
+			ConnectionName: backup.Connection.Name,
+			Status:         run.Status,
+			ErrorText:      run.ErrorText,
+			OutputKey:      run.OutputKey,
+			StartedAt:      run.StartedAt,
+			FinishedAt:     run.FinishedAt,
+		})
+	}
+
+	data := pageData{Backups: backups, RunItems: runItems}
+	if len(runItems) == 0 {
 		return data, nil
 	}
-	data.Runs = items
+
+	selected := runItems[0]
+	if selectedRunID != "" {
+		for _, item := range runItems {
+			if item.ID == selectedRunID {
+				selected = item
+				break
+			}
+		}
+	}
+
+	data.SelectedRunID = selected.ID
+	data.SelectedRun = selected
+	data.HasSelectedRun = true
+	data.RunLog = buildRunLog(selected)
 	return data, nil
 }
 
@@ -463,6 +549,251 @@ func (h *Handler) createConnection(w http.ResponseWriter, r *http.Request) {
 	h.renderConnections(w, "Connection created", "")
 }
 
+func (h *Handler) testConnection(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		h.renderConnections(w, "", "Invalid form data")
+		return
+	}
+
+	port, err := parsePort(r.FormValue("port"))
+	if err != nil {
+		h.renderConnections(w, "", err.Error())
+		return
+	}
+
+	item := models.Connection{
+		Name:     strings.TrimSpace(r.FormValue("name")),
+		Type:     strings.ToLower(strings.TrimSpace(r.FormValue("type"))),
+		Host:     strings.TrimSpace(r.FormValue("host")),
+		Port:     port,
+		Database: strings.TrimSpace(r.FormValue("database")),
+		Username: strings.TrimSpace(r.FormValue("username")),
+		Password: r.FormValue("password"),
+		SSLMode:  strings.TrimSpace(r.FormValue("ssl_mode")),
+	}
+
+	if item.Type == "" || item.Host == "" {
+		h.renderConnections(w, "", "type and host are required for connection test")
+		return
+	}
+	applyConnectionDefaults(&item)
+
+	result, err := h.probeConnection(r.Context(), item)
+	if err != nil {
+		h.renderConnections(w, "", "Connection test failed: "+err.Error())
+		return
+	}
+
+	h.renderConnections(w, "Connection test passed: "+result, "")
+}
+
+func (h *Handler) testSavedConnection(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		h.renderConnections(w, "", "connection id is required")
+		return
+	}
+
+	item, err := h.repo.GetConnection(r.Context(), id)
+	if err != nil {
+		h.renderConnections(w, "", "connection not found")
+		return
+	}
+
+	result, err := h.probeConnection(r.Context(), item)
+	if err != nil {
+		h.renderConnections(w, "", "Connection test failed for "+item.Name+": "+err.Error())
+		return
+	}
+
+	h.renderConnections(w, "Connection test passed for "+item.Name+": "+result, "")
+}
+
+func (h *Handler) testAllConnections(w http.ResponseWriter, r *http.Request) {
+	items, err := h.repo.ListConnections(r.Context())
+	if err != nil {
+		h.renderConnections(w, "", err.Error())
+		return
+	}
+
+	if len(items) == 0 {
+		h.renderConnections(w, "", "No connections to test")
+		return
+	}
+
+	passed := 0
+	failures := make([]string, 0)
+	for _, item := range items {
+		if _, err := h.probeConnection(r.Context(), item); err != nil {
+			failures = append(failures, item.Name+": "+err.Error())
+			continue
+		}
+		passed++
+	}
+
+	if len(failures) == 0 {
+		h.renderConnections(w, fmt.Sprintf("All %d connections passed connectivity checks", passed), "")
+		return
+	}
+
+	h.renderConnections(w, fmt.Sprintf("%d/%d connections passed", passed, len(items)), strings.Join(failures, " | "))
+}
+
+func applyConnectionDefaults(item *models.Connection) {
+	if item.Port != 0 {
+		return
+	}
+
+	switch strings.ToLower(strings.TrimSpace(item.Type)) {
+	case "postgres", "postgresql":
+		item.Port = 5432
+	case "mysql":
+		item.Port = 3306
+	case "mssql":
+		item.Port = 1433
+	case "redis":
+		item.Port = 6379
+	case "mongo", "mongodb":
+		item.Port = 27017
+	}
+}
+
+func (h *Handler) probeConnection(ctx context.Context, item models.Connection) (string, error) {
+	typeName := strings.ToLower(strings.TrimSpace(item.Type))
+	host := strings.TrimSpace(item.Host)
+	if host == "" {
+		return "", errors.New("host is required")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	switch typeName {
+	case "postgres", "postgresql", "mysql", "mssql", "redis", "mongo", "mongodb":
+		applyConnectionDefaults(&item)
+		if item.Port <= 0 {
+			return "", errors.New("port is required")
+		}
+		addr := host
+		if _, _, err := net.SplitHostPort(host); err != nil {
+			addr = net.JoinHostPort(host, strconv.Itoa(item.Port))
+		}
+		dialer := net.Dialer{Timeout: 4 * time.Second}
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return "", err
+		}
+		_ = conn.Close()
+		return "TCP reachability OK (" + addr + ")", nil
+	case "convex":
+		raw := strings.TrimSpace(item.Host)
+		if !strings.Contains(raw, "://") {
+			raw = "https://" + raw
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return "", errors.New("invalid Convex URL")
+		}
+		port := u.Port()
+		if port == "" {
+			if strings.EqualFold(u.Scheme, "http") {
+				port = "80"
+			} else {
+				port = "443"
+			}
+		}
+		addr := net.JoinHostPort(u.Hostname(), port)
+		dialer := net.Dialer{Timeout: 4 * time.Second}
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return "", err
+		}
+		_ = conn.Close()
+		return "Convex endpoint reachable (" + addr + ")", nil
+	case "d1":
+		accountID := strings.TrimSpace(item.Host)
+		if accountID == "" {
+			accountID = strings.TrimSpace(h.cfg.CloudflareAccountID)
+		}
+		databaseID := strings.TrimSpace(item.Database)
+		if databaseID == "" {
+			databaseID = strings.TrimSpace(h.cfg.CloudflareDatabaseID)
+		}
+		apiKey := strings.TrimSpace(item.Password)
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(h.cfg.CloudflareAPIKey)
+		}
+		if accountID == "" || databaseID == "" || apiKey == "" {
+			return "", errors.New("d1 test requires account id, database id, and api key")
+		}
+		if err := h.testD1Query(ctx, accountID, databaseID, apiKey); err != nil {
+			return "", err
+		}
+		return "Cloudflare D1 API reachable", nil
+	default:
+		return "", fmt.Errorf("unsupported connection type: %s", item.Type)
+	}
+}
+
+func (h *Handler) testD1Query(ctx context.Context, accountID, databaseID, apiKey string) error {
+	endpoint := strings.TrimSuffix(strings.TrimSpace(h.cfg.D1APIBaseURL), "/")
+	if endpoint == "" {
+		endpoint = "https://api.cloudflare.com/client/v4"
+	}
+	endpoint = endpoint + "/accounts/" + url.PathEscape(accountID) + "/d1/database/" + url.PathEscape(databaseID) + "/query"
+
+	payload, err := json.Marshal(map[string]any{"sql": "SELECT 1 AS ok"})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
+
+	var envelope struct {
+		Success bool `json:"success"`
+		Errors  []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		if res.StatusCode >= http.StatusBadRequest {
+			return fmt.Errorf("d1 query failed (status %d)", res.StatusCode)
+		}
+		return err
+	}
+
+	if res.StatusCode >= http.StatusBadRequest {
+		if len(envelope.Errors) > 0 && strings.TrimSpace(envelope.Errors[0].Message) != "" {
+			return errors.New(envelope.Errors[0].Message)
+		}
+		return fmt.Errorf("d1 query failed (status %d)", res.StatusCode)
+	}
+	if !envelope.Success {
+		if len(envelope.Errors) > 0 && strings.TrimSpace(envelope.Errors[0].Message) != "" {
+			return errors.New(envelope.Errors[0].Message)
+		}
+		return errors.New("d1 query returned unsuccessful response")
+	}
+
+	return nil
+}
+
 func (h *Handler) createRemote(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		h.renderRemotes(w, "", "Invalid form data")
@@ -655,7 +986,7 @@ func (h *Handler) renderRemotes(w http.ResponseWriter, msg, errMsg string) {
 
 func (h *Handler) renderBackups(w http.ResponseWriter, msg, errMsg string) {
 	data, _ := h.loadBackupsData(context.Background())
-	data.CurrentPage = "backups"
+	data.CurrentPage = "schedules"
 	data.BackupsMsg = msg
 	data.BackupsErr = errMsg
 	h.render(w, "backups_section", data)
@@ -696,6 +1027,98 @@ func (h *Handler) loadBackupsData(ctx context.Context) (pageData, error) {
 		return pageData{}, err
 	}
 	return pageData{Connections: connections, Remotes: remotes, Backups: backups}, nil
+}
+
+func (h *Handler) loadDashboardData(ctx context.Context) (pageData, error) {
+	connections, remotes, backups, err := h.loadCoreData(ctx)
+	if err != nil {
+		return pageData{}, err
+	}
+
+	stats := dashboardStats{
+		TotalConnections: len(connections),
+		TotalSchedules:   len(backups),
+		NextRunLabel:     "Not scheduled",
+	}
+	var nextRunAt *time.Time
+
+	for _, item := range backups {
+		if item.Enabled {
+			stats.EnabledSchedules++
+		}
+	}
+
+	runsLast30, err := h.repo.ListRunsSince(ctx, time.Now().UTC().AddDate(0, 0, -30))
+	if err != nil {
+		return pageData{}, err
+	}
+	stats.RunsLast30Days = len(runsLast30)
+	if len(runsLast30) > 0 {
+		success := 0
+		for _, run := range runsLast30 {
+			if run.Status == "success" {
+				success++
+			}
+		}
+		stats.SuccessRate = int(float64(success) / float64(len(runsLast30)) * 100)
+	}
+
+	recentRuns, err := h.repo.ListRecentRuns(ctx, 200)
+	if err != nil {
+		return pageData{}, err
+	}
+
+	backupByID := make(map[string]models.Backup, len(backups))
+	for _, item := range backups {
+		backupByID[item.ID] = item
+	}
+
+	latestByBackup := make(map[string]models.BackupRun)
+	for _, run := range recentRuns {
+		if _, seen := latestByBackup[run.BackupID]; seen {
+			continue
+		}
+		latestByBackup[run.BackupID] = run
+	}
+
+	failedConnections := make(map[string]struct{})
+	for backupID, run := range latestByBackup {
+		if run.Status != "failed" {
+			continue
+		}
+		backup := backupByID[backupID]
+		if backup.ConnectionID == "" {
+			continue
+		}
+		failedConnections[backup.ConnectionID] = struct{}{}
+	}
+
+	stats.FailedConnections = len(failedConnections)
+	stats.HealthyConnections = stats.TotalConnections - stats.FailedConnections
+	if stats.HealthyConnections < 0 {
+		stats.HealthyConnections = 0
+	}
+
+	for _, item := range backups {
+		if !item.Enabled || item.NextRunAt == nil {
+			continue
+		}
+		next := item.NextRunAt.UTC()
+		if nextRunAt == nil || next.Before(*nextRunAt) {
+			nextCopy := next
+			nextRunAt = &nextCopy
+		}
+	}
+	if nextRunAt != nil {
+		stats.NextRunLabel = nextRunAt.Format("2006-01-02 15:04 UTC")
+	}
+
+	return pageData{
+		Connections: connections,
+		Remotes:     remotes,
+		Backups:     backups,
+		Dashboard:   stats,
+	}, nil
 }
 
 func parsePort(value string) (int, error) {
@@ -749,4 +1172,121 @@ func redactBackups(items []models.Backup) {
 			items[i].Remote.SecretKey = ""
 		}
 	}
+}
+
+func connectionTypeLabel(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "postgres", "postgresql":
+		return "PostgreSQL"
+	case "mysql":
+		return "MySQL"
+	case "d1":
+		return "Cloudflare D1"
+	case "convex":
+		return "Convex"
+	case "redis":
+		return "Redis"
+	case "mssql":
+		return "MSSQL"
+	case "mongo", "mongodb":
+		return "MongoDB"
+	default:
+		return strings.ToUpper(strings.TrimSpace(v))
+	}
+}
+
+func connectionTypeIconName(v string) string {
+	_ = v
+	return "database"
+}
+
+func ago(value time.Time) string {
+	if value.IsZero() {
+		return "-"
+	}
+	d := time.Since(value)
+	if d < time.Minute {
+		return "just now"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+}
+
+func runDuration(start time.Time, finish *time.Time) string {
+	if finish == nil {
+		return "running"
+	}
+	d := finish.Sub(start)
+	if d < time.Second {
+		return "<1s"
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	minutes := int(d.Minutes())
+	seconds := int(d.Seconds()) % 60
+	if minutes < 60 {
+		return fmt.Sprintf("%dm %02ds", minutes, seconds)
+	}
+	hours := minutes / 60
+	minutes = minutes % 60
+	return fmt.Sprintf("%dh %02dm", hours, minutes)
+}
+
+func buildRunLog(item runListItem) []runLogLine {
+	lines := []runLogLine{
+		{Time: item.StartedAt.UTC().Format("15:04:05.000"), Level: "info", Message: "[anchor] Starting run for " + item.BackupName},
+		{Time: item.StartedAt.UTC().Add(150 * time.Millisecond).Format("15:04:05.000"), Level: "info", Message: "[anchor] Preparing backup pipeline"},
+	}
+
+	if item.OutputKey != "" {
+		lines = append(lines, runLogLine{
+			Time:    item.StartedAt.UTC().Add(450 * time.Millisecond).Format("15:04:05.000"),
+			Level:   "ok",
+			Message: "[anchor] Backup artifact stored at " + item.OutputKey,
+		})
+	}
+
+	if strings.TrimSpace(item.ErrorText) != "" {
+		lines = append(lines, runLogLine{
+			Time:    item.StartedAt.UTC().Add(700 * time.Millisecond).Format("15:04:05.000"),
+			Level:   "err",
+			Message: "[anchor] " + strings.TrimSpace(item.ErrorText),
+		})
+	}
+
+	if item.Status == "success" {
+		ended := item.StartedAt
+		if item.FinishedAt != nil {
+			ended = item.FinishedAt.UTC()
+		}
+		lines = append(lines, runLogLine{
+			Time:    ended.Format("15:04:05.000"),
+			Level:   "ok",
+			Message: "[anchor] Run completed successfully in " + runDuration(item.StartedAt, item.FinishedAt),
+		})
+	} else if item.Status == "failed" {
+		ended := item.StartedAt.Add(1 * time.Second)
+		if item.FinishedAt != nil {
+			ended = item.FinishedAt.UTC()
+		}
+		lines = append(lines, runLogLine{
+			Time:    ended.Format("15:04:05.000"),
+			Level:   "err",
+			Message: "[anchor] Run failed",
+		})
+	} else {
+		lines = append(lines, runLogLine{
+			Time:    time.Now().UTC().Format("15:04:05.000"),
+			Level:   "info",
+			Message: "[anchor] Run still in progress",
+		})
+	}
+
+	return lines
 }

@@ -472,6 +472,27 @@ func (r *Repository) ListBackupRuns(ctx context.Context, backupID string, limit 
 	return items, err
 }
 
+func (r *Repository) ListRecentRuns(ctx context.Context, limit int) ([]models.BackupRun, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var items []models.BackupRun
+	err := r.db.WithContext(ctx).
+		Order("started_at desc").
+		Limit(limit).
+		Find(&items).Error
+	return items, err
+}
+
+func (r *Repository) ListRunsSince(ctx context.Context, since time.Time) ([]models.BackupRun, error) {
+	var items []models.BackupRun
+	err := r.db.WithContext(ctx).
+		Where("started_at >= ?", since).
+		Order("started_at desc").
+		Find(&items).Error
+	return items, err
+}
+
 func (r *Repository) GetBackupRun(ctx context.Context, id string) (models.BackupRun, error) {
 	var run models.BackupRun
 	err := r.db.WithContext(ctx).First(&run, "id = ?", id).Error
