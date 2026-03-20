@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -77,6 +78,15 @@ func (h *Handler) createConnection(w http.ResponseWriter, r *http.Request) {
 	if req.Port == 0 {
 		req.Port = defaultPort(req.Type)
 	}
+	if req.Type == "convex" {
+		if strings.TrimSpace(req.Database) == "" {
+			req.Database = "convex"
+		}
+		if strings.TrimSpace(req.Username) == "" {
+			req.Username = "convex"
+		}
+		req.SSLMode = ""
+	}
 
 	if err := h.repo.CreateConnection(r.Context(), &req); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -124,7 +134,7 @@ func (h *Handler) updateConnection(w http.ResponseWriter, r *http.Request) {
 	if req.Type != "" {
 		req.Type = strings.ToLower(req.Type)
 		if !validConnectionType(req.Type) {
-			writeError(w, http.StatusBadRequest, "type must be mysql or postgres")
+			writeError(w, http.StatusBadRequest, "type must be mysql, postgres, or convex")
 			return
 		}
 	}
@@ -252,6 +262,15 @@ func (h *Handler) createBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	connType, err := h.resolveBackupConnectionType(r.Context(), req, "")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if connType == "convex" {
+		req.Compression = "none"
+	}
+
 	if err := h.repo.CreateBackup(r.Context(), &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -305,6 +324,19 @@ func (h *Handler) updateBackup(w http.ResponseWriter, r *http.Request) {
 	if err := h.validateBackupRequest(r, req, false); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	connType, err := h.resolveBackupConnectionType(r.Context(), req, id)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "backup not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if connType == "convex" {
+		req.Compression = "none"
 	}
 
 	item, err := h.repo.UpdateBackup(r.Context(), id, &req)
@@ -469,12 +501,15 @@ func (h *Handler) validateBackupRequest(r *http.Request, b models.Backup, create
 }
 
 func validateConnectionCreate(c models.Connection) error {
-	if c.Name == "" || c.Type == "" || c.Host == "" || c.Database == "" || c.Username == "" || c.Password == "" {
-		return errors.New("name, type, host, database, username, password are required")
+	if c.Name == "" || c.Type == "" || c.Host == "" || c.Password == "" {
+		return errors.New("name, type, host, and password are required")
 	}
 	c.Type = strings.ToLower(c.Type)
 	if !validConnectionType(c.Type) {
-		return errors.New("type must be mysql or postgres")
+		return errors.New("type must be mysql, postgres, or convex")
+	}
+	if c.Type != "convex" && (c.Database == "" || c.Username == "") {
+		return errors.New("database and username are required for mysql/postgres")
 	}
 	if c.Port < 0 || c.Port > 65535 {
 		return errors.New("port must be between 0 and 65535")
@@ -493,14 +528,35 @@ func validateRemoteCreate(rem models.Remote) error {
 }
 
 func validConnectionType(t string) bool {
-	return t == "postgres" || t == "postgresql" || t == "mysql"
+	return t == "postgres" || t == "postgresql" || t == "mysql" || t == "convex"
 }
 
 func defaultPort(t string) int {
 	if t == "postgres" || t == "postgresql" {
 		return 5432
 	}
+	if t == "convex" {
+		return 0
+	}
 	return 3306
+}
+
+func (h *Handler) resolveBackupConnectionType(ctx context.Context, b models.Backup, backupID string) (string, error) {
+	if strings.TrimSpace(b.ConnectionID) != "" {
+		conn, err := h.repo.GetConnection(ctx, strings.TrimSpace(b.ConnectionID))
+		if err != nil {
+			return "", err
+		}
+		return strings.ToLower(strings.TrimSpace(conn.Type)), nil
+	}
+	if strings.TrimSpace(backupID) == "" {
+		return "", nil
+	}
+	item, err := h.repo.GetBackup(ctx, strings.TrimSpace(backupID))
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(item.Connection.Type)), nil
 }
 
 func validCronExpr(expr string) bool {

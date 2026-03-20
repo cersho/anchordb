@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,6 +35,9 @@ func NewExecutor(cfg config.Config) *Executor {
 func (e *Executor) Run(ctx context.Context, b models.Backup) (string, error) {
 	runCtx, cancel := context.WithTimeout(ctx, e.cfg.BackupCommandTimeout)
 	defer cancel()
+	if strings.EqualFold(b.Connection.Type, "convex") {
+		return e.runConvexExport(runCtx, b)
+	}
 
 	cmd, stdout, err := buildDumpCommand(runCtx, b.Connection)
 	if err != nil {
@@ -77,6 +81,71 @@ func (e *Executor) Run(ctx context.Context, b models.Backup) (string, error) {
 	}
 	if waitErr != nil {
 		return "", fmt.Errorf("dump command failed: %w; stderr: %s", waitErr, stderr.String())
+	}
+
+	return key, nil
+}
+
+func (e *Executor) runConvexExport(ctx context.Context, b models.Backup) (string, error) {
+	tempDir, err := os.MkdirTemp("", "anchordb-convex-export-*")
+	if err != nil {
+		return "", fmt.Errorf("create temporary export directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tempDir) }()
+
+	packageJSONPath := filepath.Join(tempDir, "package.json")
+	packageJSON := []byte("{\"name\":\"anchordb-convex-export\",\"private\":true,\"dependencies\":{\"convex\":\"^1.0.0\"}}\n")
+	if err := os.WriteFile(packageJSONPath, packageJSON, 0o644); err != nil {
+		return "", fmt.Errorf("create temporary package.json: %w", err)
+	}
+
+	exportPath := filepath.Join(tempDir, "convex-export.zip")
+	args := []string{"--yes", "convex", "export", "--path", exportPath}
+	if b.IncludeFileStorage {
+		args = append(args, "--include-file-storage")
+	}
+
+	cmd := exec.CommandContext(ctx, "npx", args...)
+	cmd.Dir = tempDir
+	env := os.Environ()
+	convexURL, err := normalizeConvexURL(b.Connection.Host)
+	if err != nil {
+		return "", fmt.Errorf("invalid convex url %q: %w", strings.TrimSpace(b.Connection.Host), err)
+	}
+	env = append(env,
+		"CONVEX_URL="+convexURL,
+		"CONVEX_SELF_HOSTED_URL="+convexURL,
+		"CONVEX_SELF_HOSTED_ADMIN_KEY="+b.Connection.Password,
+	)
+	cmd.Env = env
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("convex export failed: %w; stderr: %s", err, strings.TrimSpace(stderr.String()))
+	}
+
+	f, err := os.Open(exportPath)
+	if err != nil {
+		return "", fmt.Errorf("open convex export artifact: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	key := buildObjectKey(b)
+	switch b.TargetType {
+	case "local":
+		err = e.saveLocal(b.LocalPath, key, f)
+	case "s3":
+		if b.Remote == nil {
+			err = fmt.Errorf("backup target s3 requires remote")
+		} else {
+			err = e.saveS3(ctx, *b.Remote, key, f)
+		}
+	default:
+		err = fmt.Errorf("unsupported target_type: %s", b.TargetType)
+	}
+	if err != nil {
+		return "", fmt.Errorf("store backup: %w", err)
 	}
 
 	return key, nil
@@ -172,8 +241,12 @@ func wrapCompression(input io.ReadCloser, compression string) (io.Reader, func()
 
 func buildObjectKey(b models.Backup) string {
 	now := time.Now().UTC()
-	base := fmt.Sprintf("%s/%04d/%02d/%02d/%s_%s.sql", sanitizePath(b.Connection.Name), now.Year(), now.Month(), now.Day(), b.ID, now.Format("20060102_150405"))
-	if b.Compression == "gzip" {
+	ext := ".sql"
+	if strings.EqualFold(b.Connection.Type, "convex") {
+		ext = ".zip"
+	}
+	base := fmt.Sprintf("%s/%04d/%02d/%02d/%s_%s%s", sanitizePath(b.Connection.Name), now.Year(), now.Month(), now.Day(), b.ID, now.Format("20060102_150405"), ext)
+	if ext == ".sql" && b.Compression == "gzip" {
 		base += ".gz"
 	}
 	if b.TargetType == "s3" && b.Remote != nil && b.Remote.PathPrefix != "" {
@@ -190,6 +263,24 @@ func sanitizePath(name string) string {
 		return "connection"
 	}
 	return name
+}
+
+func normalizeConvexURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("empty url")
+	}
+	if !strings.Contains(trimmed, "://") {
+		trimmed = "http://" + trimmed
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("missing scheme or host")
+	}
+	return parsed.String(), nil
 }
 
 func (e *Executor) saveLocal(basePath, key string, src io.Reader) error {

@@ -285,6 +285,63 @@
         dialog.removeAttribute("open");
       }
 
+      function syncConnectionForm() {
+        var form = document.getElementById("connection-form");
+        if (!form) return;
+        var typeSelect = form.querySelector("select[name='type']");
+        if (!typeSelect) return;
+
+        var isConvex = (typeSelect.value || "").toLowerCase() === "convex";
+        var hostLabel = document.getElementById("connection-host-label");
+        var hostInput = document.getElementById("connection-host-input");
+        var passwordLabel = document.getElementById("connection-password-label");
+
+        if (hostLabel) hostLabel.textContent = isConvex ? "Convex URL" : "Host";
+        if (hostInput) hostInput.placeholder = isConvex ? "https://your-convex" : "localhost";
+        if (passwordLabel) passwordLabel.textContent = isConvex ? "Admin Key" : "Password";
+
+        form.querySelectorAll(".conn-sql-only").forEach(function (section) {
+          section.style.display = isConvex ? "none" : "";
+          section.querySelectorAll("input, select").forEach(function (field) {
+            field.disabled = isConvex;
+            if (field.name === "database" || field.name === "username") {
+              field.required = !isConvex;
+            }
+          });
+        });
+      }
+
+      function syncBackupForm() {
+        var form = document.getElementById("backup-form");
+        if (!form) return;
+        var connectionSelect = form.querySelector("select[name='connection_id']");
+        if (!connectionSelect) return;
+
+        var selected = connectionSelect.options[connectionSelect.selectedIndex];
+        var selectedType = selected ? (selected.getAttribute("data-conn-type") || "") : "";
+        var isConvex = selectedType.toLowerCase() === "convex";
+
+        var compression = form.querySelector("select[name='compression']");
+        if (compression) {
+          if (isConvex) {
+            compression.value = "none";
+          }
+          compression.disabled = isConvex;
+        }
+
+        form.querySelectorAll(".backup-convex-only").forEach(function (section) {
+          section.style.display = isConvex ? "" : "none";
+          section.querySelectorAll("input, select").forEach(function (field) {
+            field.disabled = !isConvex;
+          });
+        });
+      }
+
+      function syncDynamicForms() {
+        syncConnectionForm();
+        syncBackupForm();
+      }
+
       document.addEventListener("click", function (event) {
         var opener = event.target.closest("[data-dialog-open]");
         if (opener) {
@@ -307,7 +364,18 @@
         }
       });
 
+      document.addEventListener("change", function (event) {
+        if (event.target && event.target.matches("#connection-form select[name='type']")) {
+          syncConnectionForm();
+          return;
+        }
+        if (event.target && event.target.matches("#backup-form select[name='connection_id']")) {
+          syncBackupForm();
+        }
+      });
+
       document.body.addEventListener("htmx:afterSwap", function () {
+        syncDynamicForms();
         document.querySelectorAll("dialog[open]").forEach(function (d) {
           if (typeof d.close === "function") {
             d.close();
@@ -316,6 +384,8 @@
           d.removeAttribute("open");
         });
       });
+
+      syncDynamicForms();
     })();
   </script>
   <header class="topbar">
@@ -350,15 +420,15 @@
     <dialog id="connection-dialog" class="dialog-modal">
       <div class="dialog">
         <div class="dialog-head"><h3>New connection</h3><button type="button" class="btn alt" data-dialog-close>Close</button></div>
-        <form class="grid-3" hx-post="/app/connections" hx-target="#connections-section" hx-swap="outerHTML">
+        <form id="connection-form" class="grid-3" hx-post="/app/connections" hx-target="#connections-section" hx-swap="outerHTML">
           <div><label>Name</label><input name="name" required></div>
-          <div><label>Type</label><select name="type"><option value="postgres">postgres</option><option value="mysql">mysql</option></select></div>
-          <div><label>Host</label><input name="host" placeholder="localhost" required></div>
-          <div><label>Port</label><input name="port" placeholder="5432"></div>
-          <div><label>Database</label><input name="database" required></div>
-          <div><label>Username</label><input name="username" required></div>
-          <div><label>Password</label><input name="password" type="password" required></div>
-          <div><label>SSL Mode</label><input name="ssl_mode" placeholder="disable"></div>
+          <div><label>Type</label><select name="type"><option value="postgres">postgres</option><option value="mysql">mysql</option><option value="convex">convex</option></select></div>
+          <div><label id="connection-host-label">Host</label><input id="connection-host-input" name="host" placeholder="localhost" required></div>
+          <div class="conn-sql-only"><label>Port</label><input name="port" placeholder="5432"></div>
+          <div class="conn-sql-only"><label>Database</label><input name="database" required></div>
+          <div class="conn-sql-only"><label>Username</label><input name="username" required></div>
+          <div><label id="connection-password-label">Password</label><input name="password" type="password" required></div>
+          <div class="conn-sql-only"><label>SSL Mode</label><input name="ssl_mode" placeholder="disable"></div>
           <div class="full"><button type="submit">Create connection</button></div>
         </form>
       </div>
@@ -375,7 +445,7 @@
         <tr>
           <td>{{.Name}}</td>
           <td>{{.Type}}</td>
-          <td>{{.Host}}:{{.Port}}</td>
+          <td>{{connectionAddress .}}</td>
           <td>{{.Database}}</td>
           <td>{{.UpdatedAt.Format "2006-01-02 15:04:05"}}</td>
         </tr>
@@ -450,13 +520,13 @@
     <dialog id="backup-dialog" class="dialog-modal">
       <div class="dialog">
         <div class="dialog-head"><h3>New backup schedule</h3><button type="button" class="btn alt" data-dialog-close>Close</button></div>
-        <form class="grid-3" hx-post="/app/backups" hx-target="#backups-section" hx-swap="outerHTML">
+        <form id="backup-form" class="grid-3" hx-post="/app/backups" hx-target="#backups-section" hx-swap="outerHTML">
           <div><label>Name</label><input name="name" required></div>
           <div>
             <label>Connection</label>
             <select name="connection_id" required>
               <option value="">Select</option>
-              {{range .Connections}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+              {{range .Connections}}<option value="{{.ID}}" data-conn-type="{{.Type}}">{{.Name}}</option>{{end}}
             </select>
           </div>
           <div><label>Cron</label><input name="cron_expr" placeholder="0 2 * * *" required></div>
@@ -477,12 +547,15 @@
             </select>
           </div>
           <div><label>Retention Days</label><input name="retention_days" value="7"></div>
-          <div>
+          <div class="backup-sql-only">
             <label>Compression</label>
             <select name="compression">
               <option value="gzip">gzip</option>
               <option value="none">none</option>
             </select>
+          </div>
+          <div class="backup-convex-only" style="display:none;">
+            <label><input type="checkbox" name="include_file_storage" value="true"> Include file storage</label>
           </div>
           <div class="full"><button type="submit">Create backup</button></div>
         </form>

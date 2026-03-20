@@ -14,7 +14,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -o /anchordb ./cmd/anchordb
 FROM alpine:3.20
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates tzdata postgresql16-client mysql-client sqlite
+RUN apk add --no-cache ca-certificates tzdata postgresql16-client mysql-client sqlite nodejs npm
 
 COPY --from=builder /anchordb /usr/local/bin/anchordb
 

@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,5 +85,36 @@ func TestDownloadRunRejectsPathTraversal(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "invalid backup path") {
 		t.Fatalf("expected invalid backup path error, got %q", string(body))
+	}
+}
+
+func TestCreateConvexConnectionFromUI(t *testing.T) {
+	stack := testutil.NewStack(t)
+	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)
+	server := httptest.NewServer(h.Router())
+	t.Cleanup(server.Close)
+
+	form := url.Values{}
+	form.Set("name", "convex-ui")
+	form.Set("type", "convex")
+	form.Set("host", "https://convex.example")
+	form.Set("password", "admin-key")
+
+	res, err := http.PostForm(server.URL+"/connections", form)
+	if err != nil {
+		t.Fatalf("post convex connection form: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if !strings.Contains(string(body), "Connection created") {
+		t.Fatalf("expected success message, got %q", string(body))
 	}
 }

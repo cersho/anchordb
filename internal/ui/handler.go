@@ -61,6 +61,12 @@ func NewHandler(repo *repository.Repository, scheduler *scheduler.Scheduler, cfg
 			}
 			return "disabled"
 		},
+		"connectionAddress": func(c models.Connection) string {
+			if strings.EqualFold(c.Type, "convex") {
+				return c.Host
+			}
+			return c.Host + ":" + strconv.Itoa(c.Port)
+		},
 		"runTone": func(status string) string {
 			switch status {
 			case "success":
@@ -405,20 +411,33 @@ func (h *Handler) createConnection(w http.ResponseWriter, r *http.Request) {
 		SSLMode:  strings.TrimSpace(r.FormValue("ssl_mode")),
 	}
 
-	if item.Name == "" || item.Type == "" || item.Host == "" || item.Database == "" || item.Username == "" || item.Password == "" {
-		h.renderConnections(w, "", "name, type, host, database, username, password are required")
+	if item.Name == "" || item.Type == "" || item.Host == "" || item.Password == "" {
+		h.renderConnections(w, "", "name, type, host, and password are required")
 		return
 	}
-	if item.Type != "postgres" && item.Type != "postgresql" && item.Type != "mysql" {
-		h.renderConnections(w, "", "type must be mysql or postgres")
+	if item.Type != "postgres" && item.Type != "postgresql" && item.Type != "mysql" && item.Type != "convex" {
+		h.renderConnections(w, "", "type must be mysql, postgres, or convex")
+		return
+	}
+	if item.Type != "convex" && (item.Database == "" || item.Username == "") {
+		h.renderConnections(w, "", "database and username are required for mysql/postgres")
 		return
 	}
 	if item.Port == 0 {
 		if item.Type == "postgres" || item.Type == "postgresql" {
 			item.Port = 5432
-		} else {
+		} else if item.Type == "mysql" {
 			item.Port = 3306
 		}
+	}
+	if item.Type == "convex" {
+		if item.Database == "" {
+			item.Database = "convex"
+		}
+		if item.Username == "" {
+			item.Username = "convex"
+		}
+		item.SSLMode = ""
 	}
 
 	if err := h.repo.CreateConnection(r.Context(), &item); err != nil {
@@ -485,12 +504,9 @@ func (h *Handler) createBackup(w http.ResponseWriter, r *http.Request) {
 	if compression == "" {
 		compression = "gzip"
 	}
+	includeFileStorage := r.FormValue("include_file_storage") == "true" || r.FormValue("include_file_storage") == "on"
 	if targetType != "local" && targetType != "s3" {
 		h.renderBackups(w, "", "target_type must be local or s3")
-		return
-	}
-	if compression != "gzip" && compression != "none" {
-		h.renderBackups(w, "", "compression must be gzip or none")
 		return
 	}
 
@@ -506,24 +522,35 @@ func (h *Handler) createBackup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	item := models.Backup{
-		Name:          strings.TrimSpace(r.FormValue("name")),
-		ConnectionID:  strings.TrimSpace(r.FormValue("connection_id")),
-		CronExpr:      cronExpr,
-		Timezone:      timezone,
-		Enabled:       true,
-		TargetType:    targetType,
-		LocalPath:     strings.TrimSpace(r.FormValue("local_path")),
-		RetentionDays: retention,
-		Compression:   compression,
+		Name:               strings.TrimSpace(r.FormValue("name")),
+		ConnectionID:       strings.TrimSpace(r.FormValue("connection_id")),
+		CronExpr:           cronExpr,
+		Timezone:           timezone,
+		Enabled:            true,
+		TargetType:         targetType,
+		LocalPath:          strings.TrimSpace(r.FormValue("local_path")),
+		RetentionDays:      retention,
+		Compression:        compression,
+		IncludeFileStorage: includeFileStorage,
 	}
 
 	if item.Name == "" || item.ConnectionID == "" {
 		h.renderBackups(w, "", "name and connection are required")
 		return
 	}
-	if _, err := h.repo.GetConnection(r.Context(), item.ConnectionID); err != nil {
+	conn, err := h.repo.GetConnection(r.Context(), item.ConnectionID)
+	if err != nil {
 		h.renderBackups(w, "", "connection_id not found")
 		return
+	}
+	if strings.EqualFold(conn.Type, "convex") {
+		item.Compression = "none"
+	} else {
+		item.IncludeFileStorage = false
+		if item.Compression != "gzip" && item.Compression != "none" {
+			h.renderBackups(w, "", "compression must be gzip or none")
+			return
+		}
 	}
 	if item.TargetType == "local" && item.LocalPath == "" {
 		h.renderBackups(w, "", "local_path is required for local target")

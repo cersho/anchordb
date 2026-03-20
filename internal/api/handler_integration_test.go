@@ -179,6 +179,85 @@ func TestCreateBackupValidationError(t *testing.T) {
 	}
 }
 
+func TestCreateConvexConnectionWithMinimalFields(t *testing.T) {
+	stack := testutil.NewStack(t)
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	t.Cleanup(server.Close)
+
+	res := doJSON(t, http.MethodPost, server.URL+"/connections", map[string]any{
+		"name":     "convex-main",
+		"type":     "convex",
+		"host":     "https://convex.example",
+		"password": "admin-key",
+	})
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", res.StatusCode)
+	}
+
+	var created models.Connection
+	decodeJSON(t, res.Body, &created)
+	if created.ID == "" {
+		t.Fatal("expected created convex connection id")
+	}
+	if created.Type != "convex" {
+		t.Fatalf("expected convex type, got %q", created.Type)
+	}
+	if created.Password != "" {
+		t.Fatalf("expected redacted password, got %q", created.Password)
+	}
+	if created.Port != 0 {
+		t.Fatalf("expected port 0 for convex, got %d", created.Port)
+	}
+}
+
+func TestCreateConvexBackupForcesNoCompression(t *testing.T) {
+	stack := testutil.NewStack(t)
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	t.Cleanup(server.Close)
+
+	connRes := doJSON(t, http.MethodPost, server.URL+"/connections", map[string]any{
+		"name":     "convex-main",
+		"type":     "convex",
+		"host":     "https://convex.example",
+		"password": "admin-key",
+	})
+	defer func() { _ = connRes.Body.Close() }()
+	if connRes.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create connection, got %d", connRes.StatusCode)
+	}
+
+	var conn models.Connection
+	decodeJSON(t, connRes.Body, &conn)
+
+	createRes := doJSON(t, http.MethodPost, server.URL+"/backups", map[string]any{
+		"name":                 "convex-nightly",
+		"connection_id":        conn.ID,
+		"cron_expr":            "0 3 * * *",
+		"timezone":             "UTC",
+		"target_type":          "local",
+		"local_path":           t.TempDir(),
+		"retention_days":       7,
+		"compression":          "gzip",
+		"include_file_storage": true,
+	})
+	defer func() { _ = createRes.Body.Close() }()
+
+	if createRes.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create backup, got %d", createRes.StatusCode)
+	}
+
+	var created models.Backup
+	decodeJSON(t, createRes.Body, &created)
+	if created.Compression != "none" {
+		t.Fatalf("expected compression none for convex backup, got %q", created.Compression)
+	}
+	if !created.IncludeFileStorage {
+		t.Fatal("expected include_file_storage=true for convex backup")
+	}
+}
+
 func doJSON(t *testing.T, method, url string, payload any) *http.Response {
 	t.Helper()
 

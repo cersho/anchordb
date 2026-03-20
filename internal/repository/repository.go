@@ -303,16 +303,20 @@ func (r *Repository) UpdateBackup(ctx context.Context, id string, in *models.Bac
 	if in.Compression != "" {
 		existing.Compression = in.Compression
 	}
+	if in.IncludeFileStorage {
+		existing.IncludeFileStorage = true
+	}
 	if err := r.db.WithContext(ctx).Model(&models.Backup{}).Where("id = ?", id).Updates(map[string]any{
-		"name":           existing.Name,
-		"connection_id":  existing.ConnectionID,
-		"cron_expr":      existing.CronExpr,
-		"timezone":       existing.Timezone,
-		"target_type":    existing.TargetType,
-		"local_path":     existing.LocalPath,
-		"remote_id":      existing.RemoteID,
-		"retention_days": existing.RetentionDays,
-		"compression":    existing.Compression,
+		"name":                 existing.Name,
+		"connection_id":        existing.ConnectionID,
+		"cron_expr":            existing.CronExpr,
+		"timezone":             existing.Timezone,
+		"target_type":          existing.TargetType,
+		"local_path":           existing.LocalPath,
+		"remote_id":            existing.RemoteID,
+		"retention_days":       existing.RetentionDays,
+		"compression":          existing.Compression,
+		"include_file_storage": existing.IncludeFileStorage,
 	}).Error; err != nil {
 		return models.Backup{}, err
 	}

@@ -31,21 +31,22 @@ type Remote struct {
 }
 
 type Backup struct {
-	ID            string     `gorm:"primaryKey;size:36" json:"id"`
-	Name          string     `gorm:"size:255;not null" json:"name"`
-	ConnectionID  string     `gorm:"size:36;not null;index" json:"connection_id"`
-	CronExpr      string     `gorm:"size:255;not null" json:"cron_expr"`
-	Timezone      string     `gorm:"size:128;not null;default:UTC" json:"timezone"`
-	Enabled       bool       `gorm:"not null;default:true" json:"enabled"`
-	TargetType    string     `gorm:"size:32;not null" json:"target_type"`
-	LocalPath     string     `gorm:"size:1024" json:"local_path"`
-	RemoteID      *string    `gorm:"size:36;index" json:"remote_id"`
-	RetentionDays int        `gorm:"not null;default:7" json:"retention_days"`
-	Compression   string     `gorm:"size:32;not null;default:gzip" json:"compression"`
-	LastRunAt     *time.Time `json:"last_run_at"`
-	NextRunAt     *time.Time `json:"next_run_at"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID                 string     `gorm:"primaryKey;size:36" json:"id"`
+	Name               string     `gorm:"size:255;not null" json:"name"`
+	ConnectionID       string     `gorm:"size:36;not null;index" json:"connection_id"`
+	CronExpr           string     `gorm:"size:255;not null" json:"cron_expr"`
+	Timezone           string     `gorm:"size:128;not null;default:UTC" json:"timezone"`
+	Enabled            bool       `gorm:"not null;default:true" json:"enabled"`
+	TargetType         string     `gorm:"size:32;not null" json:"target_type"`
+	LocalPath          string     `gorm:"size:1024" json:"local_path"`
+	RemoteID           *string    `gorm:"size:36;index" json:"remote_id"`
+	RetentionDays      int        `gorm:"not null;default:7" json:"retention_days"`
+	Compression        string     `gorm:"size:32;not null;default:gzip" json:"compression"`
+	IncludeFileStorage bool       `gorm:"not null;default:false" json:"include_file_storage"`
+	LastRunAt          *time.Time `json:"last_run_at"`
+	NextRunAt          *time.Time `json:"next_run_at"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 
 	Connection Connection `gorm:"foreignKey:ConnectionID" json:"connection,omitempty"`
 	Remote     *Remote    `gorm:"foreignKey:RemoteID" json:"remote,omitempty"`
