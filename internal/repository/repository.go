@@ -468,6 +468,12 @@ func (r *Repository) ListBackupRuns(ctx context.Context, backupID string, limit 
 	return items, err
 }
 
+func (r *Repository) GetBackupRun(ctx context.Context, id string) (models.BackupRun, error) {
+	var run models.BackupRun
+	err := r.db.WithContext(ctx).First(&run, "id = ?", id).Error
+	return run, err
+}
+
 func (r *Repository) decryptConnection(c *models.Connection) error {
 	plain, err := r.crypto.DecryptString(c.Password)
 	if err != nil {

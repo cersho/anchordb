@@ -1,0 +1,591 @@
+{{define "page"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AnchorDB Console</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    :root {
+      --background: #f7f7f8;
+      --foreground: #0f172a;
+      --card: #ffffff;
+      --card-foreground: #0f172a;
+      --muted: #f1f5f9;
+      --muted-foreground: #64748b;
+      --border: #e2e8f0;
+      --input: #ffffff;
+      --ring: #334155;
+      --primary: #0f172a;
+      --primary-foreground: #f8fafc;
+      --secondary: #e2e8f0;
+      --secondary-foreground: #0f172a;
+      --destructive: #b91c1c;
+      --destructive-foreground: #ffffff;
+      --ok: #166534;
+      --ok-bg: #dcfce7;
+      --warn: #92400e;
+      --warn-bg: #fef3c7;
+      --err: #7f1d1d;
+      --err-bg: #fee2e2;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      color: var(--foreground);
+      background:
+        radial-gradient(1200px 500px at 5% -20%, #e2e8f0 0%, transparent 60%),
+        radial-gradient(1200px 500px at 100% -10%, #dbeafe 0%, transparent 50%),
+        var(--background);
+    }
+    a { color: inherit; text-decoration: none; }
+    .topbar {
+      border-bottom: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.9);
+      backdrop-filter: blur(4px);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .topbar-inner {
+      width: min(1200px, 96vw);
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 0;
+      gap: 16px;
+    }
+    .brand {
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .brand-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: #0ea5e9;
+      box-shadow: 0 0 0 4px #e0f2fe;
+    }
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .nav a {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 7px 11px;
+      font-size: 13px;
+      color: var(--muted-foreground);
+      background: #fff;
+    }
+    .nav a.active {
+      background: var(--primary);
+      color: var(--primary-foreground);
+      border-color: var(--primary);
+    }
+    .wrap {
+      width: min(1200px, 96vw);
+      margin: 18px auto;
+      display: grid;
+      gap: 16px;
+    }
+    .card {
+      background: var(--card);
+      color: var(--card-foreground);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+    }
+    h1 { margin: 0; font-size: 24px; }
+    h2 { margin: 0; font-size: 19px; }
+    p.sub { margin: 6px 0 0; color: var(--muted-foreground); font-size: 14px; }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .full { grid-column: 1 / -1; }
+    label { font-size: 13px; color: var(--muted-foreground); display: block; margin-bottom: 5px; }
+    input, select {
+      width: 100%;
+      padding: 9px 10px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--input);
+      color: var(--foreground);
+      font-size: 13px;
+    }
+    input:focus, select:focus {
+      outline: 2px solid transparent;
+      border-color: var(--ring);
+      box-shadow: 0 0 0 3px rgba(51, 65, 85, 0.15);
+    }
+    .table-wrap {
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      overflow: hidden;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+    }
+    th, td {
+      padding: 10px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      font-size: 13px;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted-foreground);
+      font-weight: 600;
+      background: #f8fafc;
+      white-space: nowrap;
+    }
+    tr:last-child td { border-bottom: 0; }
+    .row-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .btn, button {
+      border: 1px solid var(--primary);
+      border-radius: 9px;
+      padding: 8px 11px;
+      color: var(--primary-foreground);
+      background: var(--primary);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      display: inline-block;
+    }
+    .btn:hover, button:hover { filter: brightness(0.98); }
+    .btn.alt, button.alt {
+      background: #fff;
+      color: var(--secondary-foreground);
+      border-color: var(--border);
+    }
+    .btn.danger, button.danger {
+      background: var(--destructive);
+      color: var(--destructive-foreground);
+      border-color: var(--destructive);
+    }
+    .dialog-modal {
+      width: min(760px, 92vw);
+      margin: auto;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: #fff;
+      padding: 14px;
+      box-shadow: 0 20px 40px rgba(15, 23, 42, 0.2);
+    }
+    .dialog-modal::backdrop {
+      background: rgba(15, 23, 42, 0.42);
+      backdrop-filter: blur(2px);
+    }
+    .dialog {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #f8fafc;
+      padding: 12px;
+    }
+    .dialog-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .dialog-head h3 {
+      margin: 0;
+      font-size: 14px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      border: 1px solid var(--border);
+    }
+    .enabled { background: #dcfce7; color: #166534; }
+    .disabled { background: #f1f5f9; color: #334155; }
+    .ok { background: var(--ok-bg); color: var(--ok); }
+    .err { background: var(--err-bg); color: var(--err); }
+    .muted { background: var(--warn-bg); color: var(--warn); }
+    .flash {
+      border-radius: 9px;
+      padding: 9px 10px;
+      font-size: 13px;
+      margin-bottom: 12px;
+      border: 1px solid transparent;
+    }
+    .flash.ok { background: var(--ok-bg); color: var(--ok); border-color: #bbf7d0; }
+    .flash.err { background: var(--err-bg); color: var(--err); border-color: #fecaca; }
+    .empty {
+      padding: 24px 12px;
+      text-align: center;
+      color: var(--muted-foreground);
+      font-size: 13px;
+      background: #fff;
+      border: 1px dashed var(--border);
+      border-radius: 11px;
+    }
+    @media (max-width: 900px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+      .wrap { width: min(1200px, 98vw); }
+      .topbar-inner { width: min(1200px, 98vw); align-items: flex-start; flex-direction: column; }
+      .section-head { align-items: flex-start; flex-direction: column; }
+      .table-wrap { overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+  <script>
+    (function () {
+      function openDialog(id) {
+        var dialog = document.getElementById(id);
+        if (!dialog) return;
+        if (typeof dialog.showModal === "function") {
+          dialog.showModal();
+          return;
+        }
+        dialog.setAttribute("open", "open");
+      }
+
+      function closeDialog(el) {
+        var dialog = el && el.closest ? el.closest("dialog") : null;
+        if (!dialog) return;
+        if (typeof dialog.close === "function") {
+          dialog.close();
+          return;
+        }
+        dialog.removeAttribute("open");
+      }
+
+      document.addEventListener("click", function (event) {
+        var opener = event.target.closest("[data-dialog-open]");
+        if (opener) {
+          openDialog(opener.getAttribute("data-dialog-open"));
+          return;
+        }
+
+        var closer = event.target.closest("[data-dialog-close]");
+        if (closer) {
+          closeDialog(closer);
+          return;
+        }
+
+        if (event.target.tagName === "DIALOG") {
+          var rect = event.target.getBoundingClientRect();
+          var inside = rect.top <= event.clientY && event.clientY <= rect.bottom && rect.left <= event.clientX && event.clientX <= rect.right;
+          if (!inside) {
+            closeDialog(event.target);
+          }
+        }
+      });
+
+      document.body.addEventListener("htmx:afterSwap", function () {
+        document.querySelectorAll("dialog[open]").forEach(function (d) {
+          if (typeof d.close === "function") {
+            d.close();
+            return;
+          }
+          d.removeAttribute("open");
+        });
+      });
+    })();
+  </script>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/app/connections"><span class="brand-dot"></span>AnchorDB Console</a>
+      <nav class="nav">
+        <a href="/app/connections" class="{{if eq .CurrentPage "connections"}}active{{end}}">Connections</a>
+        <a href="/app/remotes" class="{{if eq .CurrentPage "remotes"}}active{{end}}">Remotes</a>
+        <a href="/app/backups" class="{{if eq .CurrentPage "backups"}}active{{end}}">Backups</a>
+        <a href="/app/runs" class="{{if eq .CurrentPage "runs"}}active{{end}}">Runs</a>
+      </nav>
+    </div>
+  </header>
+  <div class="wrap">
+    {{if eq .CurrentPage "connections"}}{{template "connections_section" .}}{{end}}
+    {{if eq .CurrentPage "remotes"}}{{template "remotes_section" .}}{{end}}
+    {{if eq .CurrentPage "backups"}}{{template "backups_section" .}}{{end}}
+    {{if eq .CurrentPage "runs"}}{{template "runs_page" .}}{{end}}
+  </div>
+</body>
+</html>
+{{end}}
+
+{{define "connections_section"}}
+<section id="connections-section" class="card">
+  <div class="section-head">
+    <div>
+      <h2>Connections</h2>
+      <p class="sub">Database connection registry used by backup jobs.</p>
+    </div>
+    <button type="button" data-dialog-open="connection-dialog">Add connection</button>
+    <dialog id="connection-dialog" class="dialog-modal">
+      <div class="dialog">
+        <div class="dialog-head"><h3>New connection</h3><button type="button" class="btn alt" data-dialog-close>Close</button></div>
+        <form class="grid-3" hx-post="/app/connections" hx-target="#connections-section" hx-swap="outerHTML">
+          <div><label>Name</label><input name="name" required></div>
+          <div><label>Type</label><select name="type"><option value="postgres">postgres</option><option value="mysql">mysql</option></select></div>
+          <div><label>Host</label><input name="host" placeholder="localhost" required></div>
+          <div><label>Port</label><input name="port" placeholder="5432"></div>
+          <div><label>Database</label><input name="database" required></div>
+          <div><label>Username</label><input name="username" required></div>
+          <div><label>Password</label><input name="password" type="password" required></div>
+          <div><label>SSL Mode</label><input name="ssl_mode" placeholder="disable"></div>
+          <div class="full"><button type="submit">Create connection</button></div>
+        </form>
+      </div>
+    </dialog>
+  </div>
+  {{if .ConnectionsMsg}}<div class="flash ok">{{.ConnectionsMsg}}</div>{{end}}
+  {{if .ConnectionsErr}}<div class="flash err">{{.ConnectionsErr}}</div>{{end}}
+  {{if .Connections}}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Type</th><th>Host</th><th>Database</th><th>Updated</th></tr></thead>
+      <tbody>
+        {{range .Connections}}
+        <tr>
+          <td>{{.Name}}</td>
+          <td>{{.Type}}</td>
+          <td>{{.Host}}:{{.Port}}</td>
+          <td>{{.Database}}</td>
+          <td>{{.UpdatedAt.Format "2006-01-02 15:04:05"}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty">No connections yet.</div>
+  {{end}}
+</section>
+{{end}}
+
+{{define "remotes_section"}}
+<section id="remotes-section" class="card">
+  <div class="section-head">
+    <div>
+      <h2>Remotes</h2>
+      <p class="sub">S3-compatible destinations for off-site backup storage.</p>
+    </div>
+    <button type="button" data-dialog-open="remote-dialog">Add remote</button>
+    <dialog id="remote-dialog" class="dialog-modal">
+      <div class="dialog">
+        <div class="dialog-head"><h3>New remote</h3><button type="button" class="btn alt" data-dialog-close>Close</button></div>
+        <form class="grid-3" hx-post="/app/remotes" hx-target="#remotes-section" hx-swap="outerHTML">
+          <div><label>Name</label><input name="name" required></div>
+          <div><label>Provider</label><input name="provider" value="s3"></div>
+          <div><label>Bucket</label><input name="bucket" required></div>
+          <div><label>Region</label><input name="region" placeholder="us-east-1" required></div>
+          <div><label>Endpoint (optional)</label><input name="endpoint"></div>
+          <div><label>Path Prefix</label><input name="path_prefix"></div>
+          <div><label>Access Key</label><input name="access_key" required></div>
+          <div><label>Secret Key</label><input name="secret_key" type="password" required></div>
+          <div class="full"><button type="submit">Create remote</button></div>
+        </form>
+      </div>
+    </dialog>
+  </div>
+  {{if .RemotesMsg}}<div class="flash ok">{{.RemotesMsg}}</div>{{end}}
+  {{if .RemotesErr}}<div class="flash err">{{.RemotesErr}}</div>{{end}}
+  {{if .Remotes}}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Bucket</th><th>Region</th><th>Endpoint</th><th>Updated</th></tr></thead>
+      <tbody>
+        {{range .Remotes}}
+        <tr>
+          <td>{{.Name}}</td>
+          <td>{{.Bucket}}</td>
+          <td>{{.Region}}</td>
+          <td>{{.Endpoint}}</td>
+          <td>{{.UpdatedAt.Format "2006-01-02 15:04:05"}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty">No remotes yet.</div>
+  {{end}}
+</section>
+{{end}}
+
+{{define "backups_section"}}
+<section id="backups-section" class="card" hx-get="/app/backups/section" hx-trigger="every 12s" hx-target="this" hx-swap="outerHTML">
+  <div class="section-head">
+    <div>
+      <h2>Backups</h2>
+      <p class="sub">Schedules, execution controls, and retention settings.</p>
+    </div>
+    <button type="button" data-dialog-open="backup-dialog">Add backup</button>
+    <dialog id="backup-dialog" class="dialog-modal">
+      <div class="dialog">
+        <div class="dialog-head"><h3>New backup schedule</h3><button type="button" class="btn alt" data-dialog-close>Close</button></div>
+        <form class="grid-3" hx-post="/app/backups" hx-target="#backups-section" hx-swap="outerHTML">
+          <div><label>Name</label><input name="name" required></div>
+          <div>
+            <label>Connection</label>
+            <select name="connection_id" required>
+              <option value="">Select</option>
+              {{range .Connections}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+            </select>
+          </div>
+          <div><label>Cron</label><input name="cron_expr" placeholder="0 2 * * *" required></div>
+          <div><label>Timezone</label><input name="timezone" value="UTC"></div>
+          <div>
+            <label>Target</label>
+            <select name="target_type">
+              <option value="local">local</option>
+              <option value="s3">s3</option>
+            </select>
+          </div>
+          <div><label>Local Path</label><input name="local_path" placeholder="./backups"></div>
+          <div>
+            <label>Remote (for s3 target)</label>
+            <select name="remote_id">
+              <option value="">Select</option>
+              {{range .Remotes}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+            </select>
+          </div>
+          <div><label>Retention Days</label><input name="retention_days" value="7"></div>
+          <div>
+            <label>Compression</label>
+            <select name="compression">
+              <option value="gzip">gzip</option>
+              <option value="none">none</option>
+            </select>
+          </div>
+          <div class="full"><button type="submit">Create backup</button></div>
+        </form>
+      </div>
+    </dialog>
+  </div>
+  {{if .BackupsMsg}}<div class="flash ok">{{.BackupsMsg}}</div>{{end}}
+  {{if .BackupsErr}}<div class="flash err">{{.BackupsErr}}</div>{{end}}
+  {{if .Backups}}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Schedule</th><th>Target</th><th>Status</th><th>Next Run</th><th>Actions</th></tr></thead>
+      <tbody>
+        {{range .Backups}}
+        <tr>
+          <td>{{.Name}}</td>
+          <td>{{.CronExpr}} ({{.Timezone}})</td>
+          <td>{{.TargetType}}</td>
+          <td><span class="badge {{isEnabled .Enabled}}">{{isEnabled .Enabled}}</span></td>
+          <td>{{if .NextRunAt}}{{.NextRunAt.Format "2006-01-02 15:04:05 UTC"}}{{else}}-{{end}}</td>
+          <td>
+            <div class="row-actions">
+              <button class="alt" hx-post="/app/backups/{{.ID}}/run" hx-target="#backups-section" hx-swap="outerHTML">Run now</button>
+              <a class="btn alt" href="/app/runs?backup_id={{.ID}}">View runs</a>
+              {{if .Enabled}}
+              <button class="alt" hx-post="/app/backups/{{.ID}}/toggle" hx-vals='{"enabled":"false"}' hx-target="#backups-section" hx-swap="outerHTML">Disable</button>
+              {{else}}
+              <button class="alt" hx-post="/app/backups/{{.ID}}/toggle" hx-vals='{"enabled":"true"}' hx-target="#backups-section" hx-swap="outerHTML">Enable</button>
+              {{end}}
+              <button class="danger" hx-post="/app/backups/{{.ID}}/delete" hx-target="#backups-section" hx-swap="outerHTML">Delete</button>
+            </div>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty">No backups yet.</div>
+  {{end}}
+</section>
+{{end}}
+
+{{define "runs_page"}}
+<section class="card">
+  <div class="section-head">
+    <div>
+      <h2>Runs</h2>
+      <p class="sub">Track execution status and output from recent backup runs.</p>
+    </div>
+  </div>
+  <form class="grid-2" action="/app/runs" method="get" hx-get="/app/runs/section" hx-target="#runs-section" hx-swap="outerHTML">
+    <div>
+      <label>Backup</label>
+      <select name="backup_id">
+        <option value="">Select a backup</option>
+        {{range .Backups}}<option value="{{.ID}}" {{if eq $.SelectedBackupID .ID}}selected{{end}}>{{.Name}}</option>{{end}}
+      </select>
+    </div>
+    <div style="display:flex; align-items:flex-end;"><button type="submit">Load runs</button></div>
+  </form>
+</section>
+{{template "runs_section" .}}
+{{end}}
+
+{{define "runs_section"}}
+{{if .SelectedBackupID}}
+<section id="runs-section" class="card" hx-get="/app/runs/section?backup_id={{.SelectedBackupID}}" hx-trigger="every 6s" hx-target="this" hx-swap="outerHTML">
+{{else}}
+<section id="runs-section" class="card">
+{{end}}
+  <h2>Recent Runs</h2>
+  {{if .RunsErr}}<div class="flash err">{{.RunsErr}}</div>{{end}}
+  {{if .SelectedBackupID}}
+  <p class="sub">Backup ID: {{.SelectedBackupID}}</p>
+  {{end}}
+  {{if .Runs}}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Started</th><th>Status</th><th>Output</th><th>Error</th><th>Action</th></tr></thead>
+      <tbody>
+        {{range .Runs}}
+        <tr>
+          <td>{{.StartedAt.Format "2006-01-02 15:04:05 UTC"}}</td>
+          <td><span class="badge {{runTone .Status}}">{{.Status}}</span></td>
+          <td>{{.OutputKey}}</td>
+          <td>{{.ErrorText}}</td>
+          <td>
+            {{if and (eq .Status "success") .OutputKey}}
+            <a class="btn alt" href="/app/runs/{{.ID}}/download">Download</a>
+            {{else}}
+            -
+            {{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else if .SelectedBackupID}}
+  <div class="empty">No runs yet for this backup.</div>
+  {{else}}
+  <div class="empty">Select a backup to view runs.</div>
+  {{end}}
+</section>
+{{end}}

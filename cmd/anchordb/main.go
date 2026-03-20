@@ -15,6 +15,9 @@ import (
 	"anchordb/internal/metadata"
 	"anchordb/internal/repository"
 	"anchordb/internal/scheduler"
+	"anchordb/internal/ui"
+
+	"github.com/go-chi/chi/v5"
 )
 
 func main() {
@@ -40,10 +43,16 @@ func main() {
 	}
 	sch.Start()
 
-	h := api.NewHandler(repo, sch)
+	apiHandler := api.NewHandler(repo, sch)
+	uiHandler := ui.NewHandler(repo, sch, cfg)
+
+	r := chi.NewRouter()
+	r.Mount("/app", uiHandler.Router())
+	r.Mount("/", apiHandler.Router())
+
 	server := &http.Server{
 		Addr:         cfg.HTTPAddr,
-		Handler:      h.Router(),
+		Handler:      r,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,

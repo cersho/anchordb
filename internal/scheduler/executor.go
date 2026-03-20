@@ -301,7 +301,9 @@ func s3ClientFromRemote(ctx context.Context, rem models.Remote) (*s3.Client, err
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(rem.AccessKey, rem.SecretKey, "")),
 	}
 
+	usePathStyle := false
 	if rem.Endpoint != "" {
+		usePathStyle = true
 		resolver := s3.EndpointResolverFromURL(rem.Endpoint)
 		loadOpts = append(loadOpts, awsconfig.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(
 			func(service, region string, options ...interface{}) (aws.Endpoint, error) {
@@ -318,5 +320,7 @@ func s3ClientFromRemote(ctx context.Context, rem models.Remote) (*s3.Client, err
 		return nil, err
 	}
 
-	return s3.NewFromConfig(awsCfg), nil
+	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.UsePathStyle = usePathStyle
+	}), nil
 }
