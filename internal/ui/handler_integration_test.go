@@ -2,6 +2,7 @@ package ui_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -266,5 +267,137 @@ func TestNotificationTestFromUI(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("expected webhook to be called")
+	}
+}
+
+func TestUpdateSMTPNotificationFromUIKeepsPasswordWhenBlank(t *testing.T) {
+	stack := testutil.NewStack(t)
+	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)
+	server := httptest.NewServer(h.Router())
+	t.Cleanup(server.Close)
+
+	createForm := url.Values{}
+	createForm.Set("name", "ops-smtp")
+	createForm.Set("type", "smtp")
+	createForm.Set("smtp_host", "smtp.example.com")
+	createForm.Set("smtp_port_mode", "587")
+	createForm.Set("smtp_username", "alerts@example.com")
+	createForm.Set("smtp_password", "initial-secret")
+	createForm.Set("smtp_from", "alerts@example.com")
+	createForm.Set("smtp_to", "team@example.com")
+	createForm.Set("smtp_security", "starttls")
+
+	createRes, err := http.PostForm(server.URL+"/notifications", createForm)
+	if err != nil {
+		t.Fatalf("post smtp notification form: %v", err)
+	}
+	defer func() { _ = createRes.Body.Close() }()
+	if createRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", createRes.StatusCode)
+	}
+
+	notifications, err := stack.Repo.ListNotifications(context.Background())
+	if err != nil {
+		t.Fatalf("list notifications: %v", err)
+	}
+	if len(notifications) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(notifications))
+	}
+
+	updateForm := url.Values{}
+	updateForm.Set("name", "ops-smtp-updated")
+	updateForm.Set("type", "smtp")
+	updateForm.Set("smtp_host", "smtp.example.com")
+	updateForm.Set("smtp_port_mode", "587")
+	updateForm.Set("smtp_username", "alerts@example.com")
+	updateForm.Set("smtp_password", "")
+	updateForm.Set("smtp_from", "alerts@example.com")
+	updateForm.Set("smtp_to", "team@example.com")
+	updateForm.Set("smtp_security", "starttls")
+
+	updateRes, err := http.PostForm(server.URL+"/notifications/"+notifications[0].ID+"/update", updateForm)
+	if err != nil {
+		t.Fatalf("post update smtp notification form: %v", err)
+	}
+	defer func() { _ = updateRes.Body.Close() }()
+	if updateRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", updateRes.StatusCode)
+	}
+
+	updated, err := stack.Repo.GetNotification(context.Background(), notifications[0].ID)
+	if err != nil {
+		t.Fatalf("get updated notification: %v", err)
+	}
+	if updated.Name != "ops-smtp-updated" {
+		t.Fatalf("expected updated name, got %q", updated.Name)
+	}
+	if updated.SMTPPassword != "initial-secret" {
+		t.Fatalf("expected smtp password to remain unchanged")
+	}
+}
+
+func TestDeleteConnectionFromUI(t *testing.T) {
+	stack := testutil.NewStack(t)
+	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)
+	server := httptest.NewServer(h.Router())
+	t.Cleanup(server.Close)
+
+	conn := testutil.MustCreateConnection(t, stack.Repo, "ui-delete-connection")
+
+	res, err := http.Post(server.URL+"/connections/"+conn.ID+"/delete", "application/x-www-form-urlencoded", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("post delete connection: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if !strings.Contains(string(body), "Connection deleted") {
+		t.Fatalf("expected delete message, got %q", string(body))
+	}
+
+	items, err := stack.Repo.ListConnections(context.Background())
+	if err != nil {
+		t.Fatalf("list connections: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected 0 connections after delete, got %d", len(items))
+	}
+}
+
+func TestRunsPaginationFromUI(t *testing.T) {
+	stack := testutil.NewStack(t)
+	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)
+	server := httptest.NewServer(h.Router())
+	t.Cleanup(server.Close)
+
+	conn := testutil.MustCreateConnection(t, stack.Repo, "ui-runs-paging-connection")
+	backup := testutil.MustCreateLocalBackup(t, stack.Repo, "ui-runs-paging-backup", conn.ID, t.TempDir(), true)
+	for i := 0; i < 20; i++ {
+		testutil.MustCreateFinishedRun(t, stack.Repo, backup.ID, fmt.Sprintf("runs/%d.sql.gz", i))
+	}
+
+	res, err := http.Get(server.URL + "/runs/section?page=2")
+	if err != nil {
+		t.Fatalf("get runs section page 2: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if !strings.Contains(string(body), "Page 2") {
+		t.Fatalf("expected pagination marker, got %q", string(body))
 	}
 }

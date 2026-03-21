@@ -1232,6 +1232,22 @@ func (r *Repository) ListRecentRuns(ctx context.Context, limit int) ([]models.Ba
 	return items, err
 }
 
+func (r *Repository) ListRecentRunsPage(ctx context.Context, offset, limit int) ([]models.BackupRun, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var items []models.BackupRun
+	err := r.db.WithContext(ctx).
+		Order("started_at desc").
+		Offset(offset).
+		Limit(limit).
+		Find(&items).Error
+	return items, err
+}
+
 func (r *Repository) ListRunsSince(ctx context.Context, since time.Time) ([]models.BackupRun, error) {
 	var items []models.BackupRun
 	err := r.db.WithContext(ctx).
