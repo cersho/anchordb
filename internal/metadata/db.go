@@ -30,5 +30,7 @@ func Migrate(db *gorm.DB) error {
 		&models.BackupRun{},
 		&models.NotificationDestination{},
 		&models.BackupNotification{},
+		&models.HealthCheck{},
+		&models.HealthCheckNotification{},
 	)
 }

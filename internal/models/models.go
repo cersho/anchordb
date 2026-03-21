@@ -93,3 +93,37 @@ type BackupNotification struct {
 	Backup         Backup                  `gorm:"foreignKey:BackupID" json:"backup,omitempty"`
 	Notification   NotificationDestination `gorm:"foreignKey:NotificationID" json:"notification,omitempty"`
 }
+
+type HealthCheck struct {
+	ID                  string     `gorm:"primaryKey;size:36" json:"id"`
+	ConnectionID        string     `gorm:"size:36;not null;uniqueIndex" json:"connection_id"`
+	Enabled             bool       `gorm:"not null;default:true" json:"enabled"`
+	CheckIntervalSecond int        `gorm:"not null;default:60" json:"check_interval_second"`
+	TimeoutSecond       int        `gorm:"not null;default:5" json:"timeout_second"`
+	FailureThreshold    int        `gorm:"not null;default:3" json:"failure_threshold"`
+	SuccessThreshold    int        `gorm:"not null;default:1" json:"success_threshold"`
+	Status              string     `gorm:"size:32;not null;default:unknown" json:"status"`
+	ConsecutiveFailures int        `gorm:"not null;default:0" json:"consecutive_failures"`
+	ConsecutiveSuccess  int        `gorm:"not null;default:0" json:"consecutive_success"`
+	LastCheckedAt       *time.Time `json:"last_checked_at"`
+	LastError           string     `gorm:"size:2048" json:"last_error"`
+	NextCheckAt         *time.Time `gorm:"index" json:"next_check_at"`
+	LastNotifiedAt      *time.Time `json:"last_notified_at"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+
+	Connection Connection `gorm:"foreignKey:ConnectionID" json:"connection,omitempty"`
+}
+
+type HealthCheckNotification struct {
+	ID             string                  `gorm:"primaryKey;size:36" json:"id"`
+	HealthCheckID  string                  `gorm:"size:36;not null;index:idx_health_notification_unique,unique" json:"health_check_id"`
+	NotificationID string                  `gorm:"size:36;not null;index:idx_health_notification_unique,unique;index" json:"notification_id"`
+	OnDown         bool                    `gorm:"not null;default:true" json:"on_down"`
+	OnRecovered    bool                    `gorm:"not null;default:true" json:"on_recovered"`
+	Enabled        bool                    `gorm:"not null;default:true" json:"enabled"`
+	CreatedAt      time.Time               `json:"created_at"`
+	UpdatedAt      time.Time               `json:"updated_at"`
+	HealthCheck    HealthCheck             `gorm:"foreignKey:HealthCheckID" json:"health_check,omitempty"`
+	Notification   NotificationDestination `gorm:"foreignKey:NotificationID" json:"notification,omitempty"`
+}

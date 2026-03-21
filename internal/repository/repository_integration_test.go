@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"anchordb/internal/models"
 	"anchordb/internal/repository"
@@ -234,4 +235,157 @@ func TestNotificationLifecycleAndBindings(t *testing.T) {
 
 func ptrString(v string) *string {
 	return &v
+}
+
+func TestDeleteConnectionRemovesHealthChecksAndBindings(t *testing.T) {
+	stack := testutil.NewStack(t)
+	ctx := context.Background()
+
+	notification := models.NotificationDestination{
+		Name:              "health-alerts",
+		Type:              "discord",
+		Enabled:           true,
+		DiscordWebhookURL: "https://discord.com/api/webhooks/test-id/test-token",
+	}
+	if err := stack.Repo.CreateNotification(ctx, &notification); err != nil {
+		t.Fatalf("create notification: %v", err)
+	}
+
+	conn := testutil.MustCreateConnection(t, stack.Repo, "health-source")
+	check, err := stack.Repo.UpsertHealthCheckForConnection(ctx, conn.ID, repository.HealthCheckDefaults{
+		IntervalSecond:   60,
+		TimeoutSecond:    5,
+		FailureThreshold: 3,
+		SuccessThreshold: 1,
+	})
+	if err != nil {
+		t.Fatalf("upsert health check: %v", err)
+	}
+
+	bindings, err := stack.Repo.ListHealthCheckNotifications(ctx, check.ID)
+	if err != nil {
+		t.Fatalf("list health check bindings: %v", err)
+	}
+	if len(bindings) == 0 {
+		t.Fatal("expected seeded health check notification bindings")
+	}
+
+	if err := stack.Repo.DeleteConnection(ctx, conn.ID); err != nil {
+		t.Fatalf("delete connection: %v", err)
+	}
+
+	var checkCount int64
+	if err := stack.DB.WithContext(ctx).Model(&models.HealthCheck{}).Where("connection_id = ?", conn.ID).Count(&checkCount).Error; err != nil {
+		t.Fatalf("count health checks: %v", err)
+	}
+	if checkCount != 0 {
+		t.Fatalf("expected health checks deleted, got %d", checkCount)
+	}
+
+	var bindingCount int64
+	if err := stack.DB.WithContext(ctx).Model(&models.HealthCheckNotification{}).Where("health_check_id = ?", check.ID).Count(&bindingCount).Error; err != nil {
+		t.Fatalf("count health check bindings: %v", err)
+	}
+	if bindingCount != 0 {
+		t.Fatalf("expected health check bindings deleted, got %d", bindingCount)
+	}
+}
+
+func TestDeleteNotificationRemovesHealthBindings(t *testing.T) {
+	stack := testutil.NewStack(t)
+	ctx := context.Background()
+
+	conn := testutil.MustCreateConnection(t, stack.Repo, "health-binding-source")
+	if _, err := stack.Repo.UpsertHealthCheckForConnection(ctx, conn.ID, repository.HealthCheckDefaults{
+		IntervalSecond:   60,
+		TimeoutSecond:    5,
+		FailureThreshold: 3,
+		SuccessThreshold: 1,
+	}); err != nil {
+		t.Fatalf("upsert health check: %v", err)
+	}
+
+	notification := models.NotificationDestination{
+		Name:              "health-alerts-delete",
+		Type:              "discord",
+		Enabled:           true,
+		DiscordWebhookURL: "https://discord.com/api/webhooks/test-id/test-token",
+	}
+	if err := stack.Repo.CreateNotification(ctx, &notification); err != nil {
+		t.Fatalf("create notification: %v", err)
+	}
+
+	checks, err := stack.Repo.ListHealthChecks(ctx)
+	if err != nil {
+		t.Fatalf("list health checks: %v", err)
+	}
+	if len(checks) == 0 {
+		t.Fatal("expected at least one health check")
+	}
+
+	var beforeCount int64
+	if err := stack.DB.WithContext(ctx).Model(&models.HealthCheckNotification{}).Where("notification_id = ?", notification.ID).Count(&beforeCount).Error; err != nil {
+		t.Fatalf("count bindings before delete: %v", err)
+	}
+	if beforeCount == 0 {
+		t.Fatal("expected health notification bindings before delete")
+	}
+
+	if err := stack.Repo.DeleteNotification(ctx, notification.ID); err != nil {
+		t.Fatalf("delete notification: %v", err)
+	}
+
+	var afterCount int64
+	if err := stack.DB.WithContext(ctx).Model(&models.HealthCheckNotification{}).Where("notification_id = ?", notification.ID).Count(&afterCount).Error; err != nil {
+		t.Fatalf("count bindings after delete: %v", err)
+	}
+	if afterCount != 0 {
+		t.Fatalf("expected health notification bindings deleted, got %d", afterCount)
+	}
+}
+
+func TestClaimHealthCheckRunPreventsDuplicateClaims(t *testing.T) {
+	stack := testutil.NewStack(t)
+	ctx := context.Background()
+
+	conn := testutil.MustCreateConnection(t, stack.Repo, "claim-source")
+	check, err := stack.Repo.UpsertHealthCheckForConnection(ctx, conn.ID, repository.HealthCheckDefaults{
+		IntervalSecond:   60,
+		TimeoutSecond:    5,
+		FailureThreshold: 3,
+		SuccessThreshold: 1,
+	})
+	if err != nil {
+		t.Fatalf("upsert health check: %v", err)
+	}
+
+	now := time.Now().UTC()
+	claimed, err := stack.Repo.ClaimHealthCheckRun(ctx, check.ID, now, 5*time.Second)
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected first claim to succeed")
+	}
+
+	claimed, err = stack.Repo.ClaimHealthCheckRun(ctx, check.ID, now.Add(1*time.Second), 5*time.Second)
+	if err != nil {
+		t.Fatalf("second claim: %v", err)
+	}
+	if claimed {
+		t.Fatal("expected second claim to be rejected while lease is active")
+	}
+
+	past := time.Now().UTC().Add(-1 * time.Second)
+	if err := stack.DB.WithContext(ctx).Model(&models.HealthCheck{}).Where("id = ?", check.ID).Update("next_check_at", &past).Error; err != nil {
+		t.Fatalf("set next_check_at to past: %v", err)
+	}
+
+	claimed, err = stack.Repo.ClaimHealthCheckRun(ctx, check.ID, time.Now().UTC(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("third claim: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected claim to succeed after lease expires")
+	}
 }
