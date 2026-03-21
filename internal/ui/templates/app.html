@@ -677,6 +677,10 @@
         <i data-lucide="cloud"></i>
         <span>Remotes</span>
       </a>
+      <a href="/app/notifications" class="nav-item {{if eq .CurrentPage "notifications"}}active{{end}}">
+        <i data-lucide="bell-ring"></i>
+        <span>Notifications</span>
+      </a>
 
       <div class="nav-label">Automation</div>
       <a href="/app/schedules" class="nav-item {{if eq .CurrentPage "schedules"}}active{{end}}">
@@ -693,10 +697,14 @@
       {{if eq .CurrentPage "dashboard"}}{{template "dashboard_section" .}}{{end}}
       {{if eq .CurrentPage "connections"}}{{template "connections_section" .}}{{end}}
       {{if eq .CurrentPage "remotes"}}{{template "remotes_section" .}}{{end}}
+      {{if eq .CurrentPage "notifications"}}{{template "notifications_section" .}}{{end}}
       {{if eq .CurrentPage "schedules"}}{{template "backups_section" .}}{{end}}
       {{if eq .CurrentPage "runs"}}{{template "runs_page" .}}{{end}}
     </main>
   </div>
+
+  {{if eq .CurrentPage "notifications"}}{{template "notifications_dialog" .}}{{end}}
+  {{if eq .CurrentPage "schedules"}}{{template "schedule_dialog" .}}{{end}}
 
   <script>
     (function () {
@@ -833,6 +841,48 @@
         });
       }
 
+      function syncNotificationForm() {
+        var form = document.getElementById("notification-form");
+        if (!form) return;
+
+        var typeSelect = form.querySelector("select[name='type']");
+        if (!typeSelect) return;
+
+        var selectedType = (typeSelect.value || "").toLowerCase();
+        var isDiscord = selectedType === "discord";
+        var isSMTP = selectedType === "smtp";
+
+        form.querySelectorAll(".notif-discord-only").forEach(function (section) {
+          section.style.display = isDiscord ? "" : "none";
+          section.querySelectorAll("input, textarea, select").forEach(function (field) {
+            field.disabled = !isDiscord;
+            if (field.name === "discord_webhook_url") {
+              field.required = isDiscord;
+            }
+          });
+        });
+
+        form.querySelectorAll(".notif-smtp-only").forEach(function (section) {
+          section.style.display = isSMTP ? "" : "none";
+          section.querySelectorAll("input, textarea, select").forEach(function (field) {
+            field.disabled = !isSMTP;
+            if (field.name === "smtp_host" || field.name === "smtp_from" || field.name === "smtp_to") {
+              field.required = isSMTP;
+            }
+          });
+        });
+
+        var modeSelect = form.querySelector("select[name='smtp_port_mode']");
+        var customPortWrapper = form.querySelector("[data-smtp-custom-port]");
+        var customPortInput = form.querySelector("input[name='smtp_port_custom']");
+        if (modeSelect && customPortWrapper && customPortInput) {
+          var useCustomPort = isSMTP && modeSelect.value === "other";
+          customPortWrapper.style.display = useCustomPort ? "" : "none";
+          customPortInput.disabled = !useCustomPort;
+          customPortInput.required = useCustomPort;
+        }
+      }
+
       document.addEventListener("click", function (event) {
         var opener = event.target.closest("[data-dialog-open]");
         if (opener) {
@@ -858,15 +908,16 @@
         }
       });
 
-      document.body.addEventListener("htmx:afterSwap", function () {
-        document.querySelectorAll("dialog[open]").forEach(function (d) {
-          if (typeof d.close === "function") {
-            d.close();
-          } else {
-            d.removeAttribute("open");
+      document.body.addEventListener("htmx:afterSwap", function (event) {
+        var source = event && event.detail ? event.detail.elt : null;
+        if (source && source.closest) {
+          var sourceDialog = source.closest("dialog");
+          if (sourceDialog) {
+            closeDialog(sourceDialog);
           }
-        });
+        }
         syncConnectionForm();
+        syncNotificationForm();
         if (window.lucide && typeof window.lucide.createIcons === "function") {
           window.lucide.createIcons();
         }
@@ -875,10 +926,19 @@
       document.addEventListener("change", function (event) {
         if (event.target && event.target.matches("#connection-form select[name='type']")) {
           syncConnectionForm();
+          return;
+        }
+        if (event.target && event.target.matches("#notification-form select[name='type']")) {
+          syncNotificationForm();
+          return;
+        }
+        if (event.target && event.target.matches("#notification-form select[name='smtp_port_mode']")) {
+          syncNotificationForm();
         }
       });
 
       syncConnectionForm();
+      syncNotificationForm();
       if (window.lucide && typeof window.lucide.createIcons === "function") {
         window.lucide.createIcons();
       }
@@ -1134,8 +1194,124 @@
 </section>
 {{end}}
 
+{{define "notifications_section"}}
+{{if .SelectedBackupID}}
+<section id="notifications-section" class="page-block" hx-get="/app/notifications/section?backup_id={{.SelectedBackupID}}" hx-trigger="every 15s [!document.querySelector('dialog[open]')]" hx-target="this" hx-swap="outerHTML">
+{{else}}
+<section id="notifications-section" class="page-block" hx-get="/app/notifications/section" hx-trigger="every 15s [!document.querySelector('dialog[open]')]" hx-target="this" hx-swap="outerHTML">
+{{end}}
+  <div class="page-head">
+    <div>
+      <div class="page-title">Notifications</div>
+      <div class="page-sub">Create Discord and SMTP destinations, then bind them to schedules with success/failure rules.</div>
+    </div>
+    <div class="page-actions">
+      <button class="btn btn-primary btn-sm" type="button" data-dialog-open="notification-dialog">Add Destination</button>
+    </div>
+  </div>
+
+  {{if .NotificationsMsg}}<div class="flash ok">{{.NotificationsMsg}}</div>{{end}}
+  {{if .NotificationsErr}}<div class="flash err">{{.NotificationsErr}}</div>{{end}}
+
+  <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:12px;">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Status</th>
+            <th>Updated</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .Notifications}}
+            {{range .Notifications}}
+            <tr>
+              <td>{{.Name}}</td>
+              <td class="mono">{{notificationTypeLabel .Type}}</td>
+              <td><span class="badge {{isEnabled .Enabled}}">{{isEnabled .Enabled}}</span></td>
+              <td class="mono">{{ago .UpdatedAt}}</td>
+              <td>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                  <button class="btn btn-secondary btn-sm" hx-post="/app/notifications/{{.ID}}/test?backup_id={{$.SelectedBackupID}}" hx-target="#notifications-section" hx-swap="outerHTML">Test</button>
+                  <button class="btn btn-danger btn-sm" hx-post="/app/notifications/{{.ID}}/delete?backup_id={{$.SelectedBackupID}}" hx-target="#notifications-section" hx-swap="outerHTML">Delete</button>
+                </div>
+              </td>
+            </tr>
+            {{end}}
+          {{else}}
+            <tr>
+              <td colspan="5" class="mono">No notification destinations configured.</td>
+            </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="page-block" style="margin:0;">
+      <div class="page-head" style="margin-bottom:10px;">
+        <div>
+          <div class="page-title" style="font-size:16px;">Schedule Bindings</div>
+          <div class="page-sub">Pick where each schedule sends success/failure alerts.</div>
+        </div>
+      </div>
+
+      {{if and .Backups .Notifications}}
+      <form class="form-grid" hx-post="/app/notifications/bindings" hx-target="#notifications-section" hx-swap="outerHTML" style="grid-template-columns:1fr;">
+        <div>
+          <label>Schedule</label>
+          <select name="backup_id" hx-get="/app/notifications/section" hx-target="#notifications-section" hx-swap="outerHTML">
+            {{range .Backups}}
+            <option value="{{.ID}}" {{if eq $.SelectedBackupID .ID}}selected{{end}}>{{.Name}}</option>
+            {{end}}
+          </select>
+        </div>
+
+        <div class="table-wrap" style="margin-top:2px;">
+          <table>
+            <thead>
+              <tr>
+                <th>Destination</th>
+                <th>Use</th>
+                <th>Success</th>
+                <th>Failure</th>
+              </tr>
+            </thead>
+            <tbody>
+              {{range .Notifications}}
+              <tr>
+                <td>
+                  <div>{{.Name}}</div>
+                  <div class="mono">{{notificationTypeLabel .Type}}</div>
+                </td>
+                <td><input type="checkbox" name="binding_enabled_{{.ID}}" {{if bindingEnabled $.BackupBindings .ID}}checked{{end}} style="width:auto;height:auto;"></td>
+                <td><input type="checkbox" name="binding_success_{{.ID}}" {{if bindingOnSuccess $.BackupBindings .ID}}checked{{end}} style="width:auto;height:auto;"></td>
+                <td><input type="checkbox" name="binding_failure_{{.ID}}" {{if bindingOnFailure $.BackupBindings .ID}}checked{{end}} style="width:auto;height:auto;"></td>
+              </tr>
+              {{end}}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="dialog-foot" style="padding:0;border-top:none;justify-content:flex-end;">
+          <button class="btn btn-primary" type="submit">Save Bindings</button>
+        </div>
+      </form>
+      {{else if not .Backups}}
+      <div class="empty">Create a schedule before assigning notifications.</div>
+      {{else}}
+      <div class="empty">Add at least one destination to configure bindings.</div>
+      {{end}}
+    </div>
+  </div>
+
+</section>
+{{end}}
+
 {{define "backups_section"}}
-<section id="schedules-section" class="page-block" hx-get="/app/schedules/section" hx-trigger="every 12s" hx-target="this" hx-swap="outerHTML">
+<section id="schedules-section" class="page-block" hx-get="/app/schedules/section" hx-trigger="every 12s [!document.querySelector('dialog[open]')]" hx-target="this" hx-swap="outerHTML">
   <div class="page-head">
     <div>
       <div class="page-title">Schedules</div>
@@ -1158,10 +1334,11 @@
           <th>Connection</th>
           <th>Cron</th>
           <th>Target</th>
-          <th>Next Run</th>
-          <th>Status</th>
-          <th>Actions</th>
-        </tr>
+            <th>Next Run</th>
+            <th>Status</th>
+            <th>Notifications</th>
+            <th>Actions</th>
+          </tr>
       </thead>
       <tbody>
         {{range .Backups}}
@@ -1172,6 +1349,7 @@
           <td class="mono">{{if eq .TargetType "s3"}}s3 / {{if .Remote}}{{.Remote.Name}}{{else}}-{{end}}{{else}}local{{end}}</td>
           <td class="mono">{{if .NextRunAt}}{{.NextRunAt.Format "2006-01-02 15:04:05 UTC"}}{{else}}-{{end}}</td>
           <td><span class="badge {{isEnabled .Enabled}}">{{isEnabled .Enabled}}</span></td>
+          <td class="mono"><a href="/app/notifications?backup_id={{.ID}}">{{index $.BackupNotificationCounts .ID}} bound</a></td>
           <td>
             <div style="display:flex;flex-wrap:wrap;gap:6px;">
               <button class="btn btn-secondary btn-sm" hx-post="/app/backups/{{.ID}}/run" hx-target="#schedules-section" hx-swap="outerHTML">Run now</button>
@@ -1194,68 +1372,155 @@
   <div class="empty">No schedules yet. Create your first schedule to automate backups.</div>
   {{end}}
 
-  <dialog id="schedule-dialog" class="dialog-modal">
-    <div class="dialog-head">
-      <span>Add Schedule</span>
-      <button class="btn btn-ghost btn-sm" type="button" data-dialog-close>Close</button>
-    </div>
-    <div class="dialog-body">
-      <form id="backup-form" class="form-grid" hx-post="/app/backups" hx-target="#schedules-section" hx-swap="outerHTML">
-        <div>
-          <label>Name</label>
-          <input name="name" placeholder="production-every-6h" required>
-        </div>
-        <div>
-          <label>Connection</label>
-          <select name="connection_id" required>
-            <option value="">Select</option>
-            {{range .Connections}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
-          </select>
-        </div>
-        <div>
-          <label>Cron</label>
-          <input name="cron_expr" value="0 */6 * * *" required>
-        </div>
-        <div>
-          <label>Timezone</label>
-          <input name="timezone" value="UTC">
-        </div>
-        <div>
-          <label>Target</label>
-          <select name="target_type">
-            <option value="local">local</option>
-            <option value="s3">s3</option>
-          </select>
-        </div>
-        <div>
-          <label>Remote</label>
-          <select name="remote_id">
-            <option value="">Select</option>
-            {{range .Remotes}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
-          </select>
-        </div>
-        <div class="full">
-          <label>Local Path</label>
-          <input name="local_path" placeholder="./backups">
-        </div>
-        <div>
-          <label>Retention Days</label>
-          <input name="retention_days" value="7">
-        </div>
-        <div>
-          <label>Compression</label>
-          <select name="compression">
-            <option value="gzip">gzip</option>
-            <option value="none">none</option>
-          </select>
-        </div>
-        <div class="full dialog-foot" style="padding:0;border-top:none;">
-          <button type="submit" class="btn btn-primary">Create Schedule</button>
-        </div>
-      </form>
-    </div>
-  </dialog>
 </section>
+{{end}}
+
+{{define "notifications_dialog"}}
+<dialog id="notification-dialog" class="dialog-modal">
+  <div class="dialog-head">
+    <span>Add Notification Destination</span>
+    <button class="btn btn-ghost btn-sm" type="button" data-dialog-close>Close</button>
+  </div>
+  <div class="dialog-body">
+    <form id="notification-form" class="form-grid" hx-post="/app/notifications" hx-target="#notifications-section" hx-swap="outerHTML">
+      <input type="hidden" name="backup_id" value="{{.SelectedBackupID}}">
+      <div>
+        <label>Name</label>
+        <input name="name" placeholder="ops-discord" required>
+      </div>
+      <div>
+        <label>Type</label>
+        <select name="type">
+          <option value="discord">discord</option>
+          <option value="smtp">smtp</option>
+        </select>
+      </div>
+
+      <div class="notif-discord-only full">
+        <label>Discord Webhook URL</label>
+        <input name="discord_webhook_url" placeholder="https://discord.com/api/webhooks/..." required>
+      </div>
+
+      <div class="notif-smtp-only">
+        <label>SMTP Host</label>
+        <input name="smtp_host" placeholder="smtp.example.com">
+      </div>
+      <div class="notif-smtp-only">
+        <label>SMTP Port Preset</label>
+        <select name="smtp_port_mode">
+          <option value="587">587 (submission)</option>
+          <option value="465">465 (SSL/TLS)</option>
+          <option value="25">25 (relay)</option>
+          <option value="2525">2525 (provider alt)</option>
+          <option value="other">other</option>
+        </select>
+      </div>
+      <div class="notif-smtp-only" data-smtp-custom-port>
+        <label>Custom SMTP Port</label>
+        <input name="smtp_port_custom" placeholder="1025">
+      </div>
+      <div class="notif-smtp-only">
+        <label>SMTP Username</label>
+        <input name="smtp_username" placeholder="alerts@example.com">
+      </div>
+      <div class="notif-smtp-only">
+        <label>SMTP Password</label>
+        <input name="smtp_password" type="password">
+      </div>
+      <div class="notif-smtp-only">
+        <label>SMTP From</label>
+        <input name="smtp_from" placeholder="alerts@example.com">
+      </div>
+      <div class="notif-smtp-only">
+        <label>SMTP Security</label>
+        <select name="smtp_security">
+          <option value="starttls">starttls</option>
+          <option value="ssl_tls">ssl/tls</option>
+          <option value="none">none</option>
+        </select>
+      </div>
+      <div class="notif-smtp-only full">
+        <label>Recipients</label>
+        <textarea name="smtp_to" placeholder="ops@example.com, admin@example.com"></textarea>
+      </div>
+
+      <div class="full">
+        <label style="display:flex;align-items:center;gap:8px;margin:0;text-transform:none;font-family:var(--font-ui);font-size:13px;color:var(--text-primary);">
+          <input type="checkbox" name="enabled" checked style="width:auto;height:auto;">
+          Destination enabled
+        </label>
+      </div>
+
+      <div class="full dialog-foot" style="padding:0;border-top:none;justify-content:flex-end;">
+        <button type="submit" class="btn btn-primary">Save Destination</button>
+      </div>
+    </form>
+  </div>
+</dialog>
+{{end}}
+
+{{define "schedule_dialog"}}
+<dialog id="schedule-dialog" class="dialog-modal">
+  <div class="dialog-head">
+    <span>Add Schedule</span>
+    <button class="btn btn-ghost btn-sm" type="button" data-dialog-close>Close</button>
+  </div>
+  <div class="dialog-body">
+    <form id="backup-form" class="form-grid" hx-post="/app/backups" hx-target="#schedules-section" hx-swap="outerHTML">
+      <div>
+        <label>Name</label>
+        <input name="name" placeholder="production-every-6h" required>
+      </div>
+      <div>
+        <label>Connection</label>
+        <select name="connection_id" required>
+          <option value="">Select</option>
+          {{range .Connections}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+        </select>
+      </div>
+      <div>
+        <label>Cron</label>
+        <input name="cron_expr" value="0 */6 * * *" required>
+      </div>
+      <div>
+        <label>Timezone</label>
+        <input name="timezone" value="UTC">
+      </div>
+      <div>
+        <label>Target</label>
+        <select name="target_type">
+          <option value="local">local</option>
+          <option value="s3">s3</option>
+        </select>
+      </div>
+      <div>
+        <label>Remote</label>
+        <select name="remote_id">
+          <option value="">Select</option>
+          {{range .Remotes}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+        </select>
+      </div>
+      <div class="full">
+        <label>Local Path</label>
+        <input name="local_path" placeholder="./backups">
+      </div>
+      <div>
+        <label>Retention Days</label>
+        <input name="retention_days" value="7">
+      </div>
+      <div>
+        <label>Compression</label>
+        <select name="compression">
+          <option value="gzip">gzip</option>
+          <option value="none">none</option>
+        </select>
+      </div>
+      <div class="full dialog-foot" style="padding:0;border-top:none;">
+        <button type="submit" class="btn btn-primary">Create Schedule</button>
+      </div>
+    </form>
+  </div>
+</dialog>
 {{end}}
 
 {{define "runs_page"}}
@@ -1272,9 +1537,9 @@
 
 {{define "runs_section"}}
 {{if .SelectedRunID}}
-<section id="runs-section" class="page-block" hx-get="/app/runs/section?run_id={{.SelectedRunID}}" hx-trigger="every 8s" hx-target="this" hx-swap="outerHTML">
+<section id="runs-section" class="page-block" hx-get="/app/runs/section?run_id={{.SelectedRunID}}" hx-trigger="every 8s [!document.querySelector('dialog[open]')]" hx-target="this" hx-swap="outerHTML">
 {{else}}
-<section id="runs-section" class="page-block" hx-get="/app/runs/section" hx-trigger="every 8s" hx-target="this" hx-swap="outerHTML">
+<section id="runs-section" class="page-block" hx-get="/app/runs/section" hx-trigger="every 8s [!document.querySelector('dialog[open]')]" hx-target="this" hx-swap="outerHTML">
 {{end}}
   {{if .RunsErr}}<div class="flash err">{{.RunsErr}}</div>{{end}}
 

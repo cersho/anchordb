@@ -292,6 +292,101 @@ func TestCreateD1ConnectionWithMinimalFields(t *testing.T) {
 	}
 }
 
+func TestNotificationsEndpointsAndBackupBindings(t *testing.T) {
+	stack := testutil.NewStack(t)
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	t.Cleanup(server.Close)
+
+	createNotificationRes := doJSON(t, http.MethodPost, server.URL+"/notifications", map[string]any{
+		"name":                "discord-ops",
+		"type":                "discord",
+		"discord_webhook_url": "https://discord.com/api/webhooks/test-id/test-token",
+	})
+	defer func() { _ = createNotificationRes.Body.Close() }()
+	if createNotificationRes.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create notification, got %d", createNotificationRes.StatusCode)
+	}
+
+	var destination models.NotificationDestination
+	decodeJSON(t, createNotificationRes.Body, &destination)
+	if destination.ID == "" {
+		t.Fatal("expected created notification id")
+	}
+	if destination.DiscordWebhookURL != "" {
+		t.Fatalf("expected redacted webhook URL, got %q", destination.DiscordWebhookURL)
+	}
+
+	conn := testutil.MustCreateConnection(t, stack.Repo, "api-notify-source")
+	backup := testutil.MustCreateLocalBackup(t, stack.Repo, "api-notify-backup", conn.ID, t.TempDir(), true)
+
+	setBindingsRes := doJSON(t, http.MethodPut, server.URL+"/backups/"+backup.ID+"/notifications", map[string]any{
+		"notifications": []map[string]any{{
+			"notification_id": destination.ID,
+			"on_success":      true,
+			"on_failure":      true,
+			"enabled":         true,
+		}},
+	})
+	defer func() { _ = setBindingsRes.Body.Close() }()
+	if setBindingsRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from set backup notifications, got %d", setBindingsRes.StatusCode)
+	}
+
+	listBindingsRes := doJSON(t, http.MethodGet, server.URL+"/backups/"+backup.ID+"/notifications", nil)
+	defer func() { _ = listBindingsRes.Body.Close() }()
+	if listBindingsRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from list backup notifications, got %d", listBindingsRes.StatusCode)
+	}
+
+	var bindings []models.BackupNotification
+	decodeJSON(t, listBindingsRes.Body, &bindings)
+	if len(bindings) != 1 {
+		t.Fatalf("expected 1 backup notification binding, got %d", len(bindings))
+	}
+	if bindings[0].Notification.DiscordWebhookURL != "" {
+		t.Fatalf("expected redacted webhook URL in bindings, got %q", bindings[0].Notification.DiscordWebhookURL)
+	}
+}
+
+func TestNotificationTestEndpointSendsDiscordWebhook(t *testing.T) {
+	stack := testutil.NewStack(t)
+	apiServer := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	t.Cleanup(apiServer.Close)
+
+	called := false
+	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST webhook request, got %s", r.Method)
+		}
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(webhookServer.Close)
+
+	createRes := doJSON(t, http.MethodPost, apiServer.URL+"/notifications", map[string]any{
+		"name":                "discord-test",
+		"type":                "discord",
+		"discord_webhook_url": webhookServer.URL,
+	})
+	defer func() { _ = createRes.Body.Close() }()
+	if createRes.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from create notification, got %d", createRes.StatusCode)
+	}
+
+	var destination models.NotificationDestination
+	decodeJSON(t, createRes.Body, &destination)
+
+	testRes := doJSON(t, http.MethodPost, apiServer.URL+"/notifications/"+destination.ID+"/test", nil)
+	defer func() { _ = testRes.Body.Close() }()
+	if testRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from test notification endpoint, got %d", testRes.StatusCode)
+	}
+
+	if !called {
+		t.Fatal("expected webhook endpoint to be called")
+	}
+}
+
 func doJSON(t *testing.T, method, url string, payload any) *http.Response {
 	t.Helper()
 

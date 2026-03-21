@@ -1,6 +1,7 @@
 package ui_test
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"anchordb/internal/models"
 	"anchordb/internal/testutil"
 	"anchordb/internal/ui"
 )
@@ -148,5 +150,121 @@ func TestCreateD1ConnectionFromUI(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "Connection created") {
 		t.Fatalf("expected success message, got %q", string(body))
+	}
+}
+
+func TestCreateNotificationAndBindToScheduleFromUI(t *testing.T) {
+	stack := testutil.NewStack(t)
+	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)
+	server := httptest.NewServer(h.Router())
+	t.Cleanup(server.Close)
+
+	conn := testutil.MustCreateConnection(t, stack.Repo, "ui-notify-source")
+	backup := testutil.MustCreateLocalBackup(t, stack.Repo, "ui-notify-backup", conn.ID, t.TempDir(), true)
+
+	createForm := url.Values{}
+	createForm.Set("backup_id", backup.ID)
+	createForm.Set("name", "ops-discord")
+	createForm.Set("type", "discord")
+	createForm.Set("discord_webhook_url", "https://discord.com/api/webhooks/test-id/test-token")
+
+	createRes, err := http.PostForm(server.URL+"/notifications", createForm)
+	if err != nil {
+		t.Fatalf("post notification form: %v", err)
+	}
+	defer func() { _ = createRes.Body.Close() }()
+	if createRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", createRes.StatusCode)
+	}
+	body, err := io.ReadAll(createRes.Body)
+	if err != nil {
+		t.Fatalf("read create notification response body: %v", err)
+	}
+	if !strings.Contains(string(body), "Notification destination created") {
+		t.Fatalf("expected create notification message, got %q", string(body))
+	}
+
+	notifications, err := stack.Repo.ListNotifications(context.Background())
+	if err != nil {
+		t.Fatalf("list notifications: %v", err)
+	}
+	if len(notifications) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(notifications))
+	}
+
+	bindingsForm := url.Values{}
+	bindingsForm.Set("backup_id", backup.ID)
+	bindingsForm.Set("binding_enabled_"+notifications[0].ID, "on")
+	bindingsForm.Set("binding_success_"+notifications[0].ID, "on")
+	bindingsForm.Set("binding_failure_"+notifications[0].ID, "on")
+
+	bindRes, err := http.PostForm(server.URL+"/notifications/bindings", bindingsForm)
+	if err != nil {
+		t.Fatalf("post bindings form: %v", err)
+	}
+	defer func() { _ = bindRes.Body.Close() }()
+	if bindRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", bindRes.StatusCode)
+	}
+
+	bindBody, err := io.ReadAll(bindRes.Body)
+	if err != nil {
+		t.Fatalf("read bind response body: %v", err)
+	}
+	if !strings.Contains(string(bindBody), "Schedule notifications updated") {
+		t.Fatalf("expected schedule bindings updated message, got %q", string(bindBody))
+	}
+
+	bindings, err := stack.Repo.ListBackupNotifications(context.Background(), backup.ID)
+	if err != nil {
+		t.Fatalf("list backup bindings: %v", err)
+	}
+	if len(bindings) != 1 {
+		t.Fatalf("expected 1 backup binding, got %d", len(bindings))
+	}
+}
+
+func TestNotificationTestFromUI(t *testing.T) {
+	stack := testutil.NewStack(t)
+	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)
+	server := httptest.NewServer(h.Router())
+	t.Cleanup(server.Close)
+
+	called := false
+	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(webhookServer.Close)
+
+	notification := models.NotificationDestination{
+		Name:              "ui-discord-test",
+		Type:              "discord",
+		Enabled:           true,
+		DiscordWebhookURL: webhookServer.URL,
+	}
+	if err := stack.Repo.CreateNotification(context.Background(), &notification); err != nil {
+		t.Fatalf("create notification destination: %v", err)
+	}
+
+	res, err := http.Post(server.URL+"/notifications/"+notification.ID+"/test", "application/x-www-form-urlencoded", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("post notification test endpoint: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if !strings.Contains(string(body), "Test notification sent") {
+		t.Fatalf("expected test notification success message, got %q", string(body))
+	}
+	if !called {
+		t.Fatal("expected webhook to be called")
 	}
 }
