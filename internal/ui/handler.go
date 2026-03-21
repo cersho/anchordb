@@ -53,6 +53,10 @@ type pageData struct {
 	Runs                     []models.BackupRun
 	RunItems                 []runListItem
 	RunLog                   []runLogLine
+	RunsPage                 int
+	RunsPageSize             int
+	RunsHasPrev              bool
+	RunsHasNext              bool
 	SelectedRunID            string
 	SelectedRun              runListItem
 	HasSelectedRun           bool
@@ -110,6 +114,15 @@ type runLogLine struct {
 
 func NewHandler(repo *repository.Repository, scheduler *scheduler.Scheduler, cfg config.Config) *Handler {
 	tmpl := template.Must(template.New("app").Funcs(template.FuncMap{
+		"inc": func(v int) int {
+			return v + 1
+		},
+		"dec": func(v int) int {
+			if v <= 1 {
+				return 1
+			}
+			return v - 1
+		},
 		"isEnabled": func(v bool) string {
 			if v {
 				return "enabled"
@@ -210,21 +223,27 @@ func (h *Handler) Router() http.Handler {
 	r.Get("/connections", h.connectionsPage)
 	r.Get("/connections/section", h.connectionsSection)
 	r.Post("/connections", h.createConnection)
+	r.Post("/connections/{id}/update", h.updateConnection)
+	r.Post("/connections/{id}/delete", h.deleteConnection)
 	r.Post("/connections/test", h.testConnection)
 	r.Post("/connections/test-all", h.testAllConnections)
 	r.Post("/connections/{id}/test", h.testSavedConnection)
 	r.Get("/remotes", h.remotesPage)
 	r.Get("/remotes/section", h.remotesSection)
 	r.Post("/remotes", h.createRemote)
+	r.Post("/remotes/{id}/update", h.updateRemote)
+	r.Post("/remotes/{id}/delete", h.deleteRemote)
 	r.Get("/notifications", h.notificationsPage)
 	r.Get("/notifications/section", h.notificationsSection)
 	r.Post("/notifications", h.createNotification)
+	r.Post("/notifications/{id}/update", h.updateNotification)
 	r.Post("/notifications/{id}/test", h.testNotification)
 	r.Post("/notifications/{id}/delete", h.deleteNotification)
 	r.Post("/notifications/bindings", h.saveNotificationBindings)
 	r.Get("/health-checks", h.healthChecksPage)
 	r.Get("/health-checks/section", h.healthChecksSection)
 	r.Post("/health-checks/{id}/settings", h.updateHealthCheckSettings)
+	r.Post("/health-checks/{id}/archive", h.archiveHealthCheck)
 	r.Post("/health-checks/{id}/run", h.runHealthCheckNow)
 	r.Post("/health-checks/bindings", h.saveHealthCheckBindings)
 	r.Get("/backups", h.backupsPage)
@@ -232,6 +251,7 @@ func (h *Handler) Router() http.Handler {
 	r.Get("/backups/section", h.backupsSection)
 	r.Get("/schedules/section", h.backupsSection)
 	r.Post("/backups", h.createBackup)
+	r.Post("/backups/{id}/update", h.updateBackup)
 	r.Post("/backups/{id}/run", h.runBackupNow)
 	r.Post("/backups/{id}/toggle", h.toggleBackup)
 	r.Post("/backups/{id}/delete", h.deleteBackup)
@@ -365,7 +385,11 @@ func (h *Handler) backupRuns(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) runsPage(w http.ResponseWriter, r *http.Request) {
-	data, err := h.loadRunsData(r.Context(), strings.TrimSpace(r.URL.Query().Get("run_id")))
+	data, err := h.loadRunsData(
+		r.Context(),
+		strings.TrimSpace(r.URL.Query().Get("run_id")),
+		parsePositiveInt(r.URL.Query().Get("page"), 1),
+	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -375,7 +399,11 @@ func (h *Handler) runsPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) runsSection(w http.ResponseWriter, r *http.Request) {
-	data, err := h.loadRunsData(r.Context(), strings.TrimSpace(r.URL.Query().Get("run_id")))
+	data, err := h.loadRunsData(
+		r.Context(),
+		strings.TrimSpace(r.URL.Query().Get("run_id")),
+		parsePositiveInt(r.URL.Query().Get("page"), 1),
+	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -383,7 +411,13 @@ func (h *Handler) runsSection(w http.ResponseWriter, r *http.Request) {
 	h.render(w, "runs_section", data)
 }
 
-func (h *Handler) loadRunsData(ctx context.Context, selectedRunID string) (pageData, error) {
+func (h *Handler) loadRunsData(ctx context.Context, selectedRunID string, page int) (pageData, error) {
+	if page < 1 {
+		page = 1
+	}
+	const pageSize = 15
+	offset := (page - 1) * pageSize
+
 	backups, err := h.repo.ListBackups(ctx)
 	if err != nil {
 		return pageData{}, err
@@ -395,9 +429,14 @@ func (h *Handler) loadRunsData(ctx context.Context, selectedRunID string) (pageD
 		backupByID[item.ID] = item
 	}
 
-	runs, err := h.repo.ListRecentRuns(ctx, 60)
+	runs, err := h.repo.ListRecentRunsPage(ctx, offset, pageSize+1)
 	if err != nil {
 		return pageData{}, err
+	}
+
+	hasNext := len(runs) > pageSize
+	if hasNext {
+		runs = runs[:pageSize]
 	}
 
 	runItems := make([]runListItem, 0, len(runs))
@@ -416,7 +455,14 @@ func (h *Handler) loadRunsData(ctx context.Context, selectedRunID string) (pageD
 		})
 	}
 
-	data := pageData{Backups: backups, RunItems: runItems}
+	data := pageData{
+		Backups:      backups,
+		RunItems:     runItems,
+		RunsPage:     page,
+		RunsPageSize: pageSize,
+		RunsHasPrev:  page > 1,
+		RunsHasNext:  hasNext,
+	}
 	if len(runItems) == 0 {
 		return data, nil
 	}
@@ -436,6 +482,96 @@ func (h *Handler) loadRunsData(ctx context.Context, selectedRunID string) (pageD
 	data.HasSelectedRun = true
 	data.RunLog = buildRunLog(selected)
 	return data, nil
+}
+
+func (h *Handler) updateConnection(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		h.renderConnections(w, "", "connection id is required")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		h.renderConnections(w, "", "Invalid form data")
+		return
+	}
+
+	port, err := parsePort(r.FormValue("port"))
+	if err != nil {
+		h.renderConnections(w, "", err.Error())
+		return
+	}
+
+	item := models.Connection{
+		Name:     strings.TrimSpace(r.FormValue("name")),
+		Type:     strings.ToLower(strings.TrimSpace(r.FormValue("type"))),
+		Host:     strings.TrimSpace(r.FormValue("host")),
+		Port:     port,
+		Database: strings.TrimSpace(r.FormValue("database")),
+		Username: strings.TrimSpace(r.FormValue("username")),
+		Password: r.FormValue("password"),
+		SSLMode:  strings.TrimSpace(r.FormValue("ssl_mode")),
+	}
+
+	if item.Name == "" || item.Type == "" || item.Host == "" {
+		h.renderConnections(w, "", "name, type, and host are required")
+		return
+	}
+	if item.Type != "postgres" && item.Type != "postgresql" && item.Type != "mysql" && item.Type != "convex" && item.Type != "d1" {
+		h.renderConnections(w, "", "type must be mysql, postgres, convex, or d1")
+		return
+	}
+	if item.Type == "d1" && item.Database == "" {
+		h.renderConnections(w, "", "database is required for d1")
+		return
+	}
+	if item.Type != "convex" && item.Type != "d1" && (item.Database == "" || item.Username == "") {
+		h.renderConnections(w, "", "database and username are required for mysql/postgres")
+		return
+	}
+	if item.Port == 0 {
+		switch item.Type {
+		case "postgres", "postgresql":
+			item.Port = 5432
+		case "mysql":
+			item.Port = 3306
+		}
+	}
+	if item.Type == "convex" {
+		if item.Database == "" {
+			item.Database = "convex"
+		}
+		if item.Username == "" {
+			item.Username = "convex"
+		}
+		item.SSLMode = ""
+	}
+	if item.Type == "d1" {
+		if item.Username == "" {
+			item.Username = "d1"
+		}
+		item.Port = 0
+		item.SSLMode = ""
+	}
+
+	if _, err := h.repo.UpdateConnection(r.Context(), id, &item); err != nil {
+		h.renderConnections(w, "", err.Error())
+		return
+	}
+
+	h.renderConnections(w, "Connection updated", "")
+}
+
+func (h *Handler) deleteConnection(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		h.renderConnections(w, "", "connection id is required")
+		return
+	}
+	if err := h.repo.DeleteConnection(r.Context(), id); err != nil {
+		h.renderConnections(w, "", "connection not found")
+		return
+	}
+	h.renderConnections(w, "Connection deleted", "")
 }
 
 func (h *Handler) downloadRun(w http.ResponseWriter, r *http.Request) {
@@ -815,6 +951,63 @@ func (h *Handler) createRemote(w http.ResponseWriter, r *http.Request) {
 	h.renderRemotes(w, "Remote created", "")
 }
 
+func (h *Handler) updateRemote(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		h.renderRemotes(w, "", "remote id is required")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		h.renderRemotes(w, "", "Invalid form data")
+		return
+	}
+
+	provider := strings.ToLower(strings.TrimSpace(r.FormValue("provider")))
+	if provider == "" {
+		provider = "s3"
+	}
+
+	item := models.Remote{
+		Name:       strings.TrimSpace(r.FormValue("name")),
+		Provider:   provider,
+		Bucket:     strings.TrimSpace(r.FormValue("bucket")),
+		Region:     strings.TrimSpace(r.FormValue("region")),
+		Endpoint:   strings.TrimSpace(r.FormValue("endpoint")),
+		AccessKey:  strings.TrimSpace(r.FormValue("access_key")),
+		SecretKey:  strings.TrimSpace(r.FormValue("secret_key")),
+		PathPrefix: strings.TrimSpace(r.FormValue("path_prefix")),
+	}
+
+	if item.Name == "" || item.Bucket == "" || item.Region == "" {
+		h.renderRemotes(w, "", "name, bucket, and region are required")
+		return
+	}
+	if item.Provider != "s3" {
+		h.renderRemotes(w, "", "provider must be s3")
+		return
+	}
+
+	if _, err := h.repo.UpdateRemote(r.Context(), id, &item); err != nil {
+		h.renderRemotes(w, "", err.Error())
+		return
+	}
+
+	h.renderRemotes(w, "Remote updated", "")
+}
+
+func (h *Handler) deleteRemote(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		h.renderRemotes(w, "", "remote id is required")
+		return
+	}
+	if err := h.repo.DeleteRemote(r.Context(), id); err != nil {
+		h.renderRemotes(w, "", "remote not found")
+		return
+	}
+	h.renderRemotes(w, "Remote deleted", "")
+}
+
 func (h *Handler) createNotification(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		h.renderNotifications(w, "", "Invalid form data", strings.TrimSpace(r.FormValue("backup_id")))
@@ -862,6 +1055,68 @@ func (h *Handler) createNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.renderNotifications(w, "Notification destination created", "", selectedBackupID)
+}
+
+func (h *Handler) updateNotification(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		h.renderNotifications(w, "", "notification id is required", strings.TrimSpace(r.FormValue("backup_id")))
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		h.renderNotifications(w, "", "Invalid form data", strings.TrimSpace(r.FormValue("backup_id")))
+		return
+	}
+
+	selectedBackupID := strings.TrimSpace(r.FormValue("backup_id"))
+	notificationType := strings.ToLower(strings.TrimSpace(r.FormValue("type")))
+	enabled := r.FormValue("enabled") == "on" || r.FormValue("enabled") == "true"
+
+	name := strings.TrimSpace(r.FormValue("name"))
+	discordWebhookURL := strings.TrimSpace(r.FormValue("discord_webhook_url"))
+	smtpHost := strings.TrimSpace(r.FormValue("smtp_host"))
+	smtpUsername := strings.TrimSpace(r.FormValue("smtp_username"))
+	smtpPassword := r.FormValue("smtp_password")
+	smtpFrom := strings.TrimSpace(r.FormValue("smtp_from"))
+	smtpTo := strings.TrimSpace(r.FormValue("smtp_to"))
+	smtpSecurity := strings.ToLower(strings.TrimSpace(r.FormValue("smtp_security")))
+
+	smtpPort := 587
+	portRaw := strings.TrimSpace(r.FormValue("smtp_port"))
+	portMode := strings.TrimSpace(r.FormValue("smtp_port_mode"))
+	if portMode != "" && portMode != "other" {
+		portRaw = portMode
+	}
+	if portMode == "other" {
+		portRaw = strings.TrimSpace(r.FormValue("smtp_port_custom"))
+	}
+	if portRaw != "" {
+		port, err := strconv.Atoi(portRaw)
+		if err != nil || port <= 0 || port > 65535 {
+			h.renderNotifications(w, "", "smtp_port must be between 1 and 65535", selectedBackupID)
+			return
+		}
+		smtpPort = port
+	}
+
+	if _, err := h.repo.UpdateNotification(r.Context(), id, repository.NotificationPatch{
+		Name:              stringPtr(name),
+		Type:              stringPtr(notificationType),
+		Enabled:           boolPtr(enabled),
+		DiscordWebhookURL: stringPtr(discordWebhookURL),
+		SMTPHost:          stringPtr(smtpHost),
+		SMTPPort:          intPtr(smtpPort),
+		SMTPUsername:      stringPtr(smtpUsername),
+		SMTPPassword:      stringPtr(smtpPassword),
+		SMTPFrom:          stringPtr(smtpFrom),
+		SMTPTo:            stringPtr(smtpTo),
+		SMTPSecurity:      stringPtr(smtpSecurity),
+	}); err != nil {
+		h.renderNotifications(w, "", err.Error(), selectedBackupID)
+		return
+	}
+
+	h.renderNotifications(w, "Notification destination updated", "", selectedBackupID)
 }
 
 func (h *Handler) testNotification(w http.ResponseWriter, r *http.Request) {
@@ -1109,6 +1364,21 @@ func (h *Handler) saveHealthCheckBindings(w http.ResponseWriter, r *http.Request
 	h.renderHealthChecks(w, "Health check notifications updated", "", selectedHealthCheckID)
 }
 
+func (h *Handler) archiveHealthCheck(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	selectedHealthCheckID := strings.TrimSpace(r.URL.Query().Get("health_check_id"))
+	if id == "" {
+		h.renderHealthChecks(w, "", "health check id is required", selectedHealthCheckID)
+		return
+	}
+	enabled := false
+	if _, err := h.repo.UpdateHealthCheck(r.Context(), id, repository.HealthCheckPatch{Enabled: &enabled}); err != nil {
+		h.renderHealthChecks(w, "", err.Error(), selectedHealthCheckID)
+		return
+	}
+	h.renderHealthChecks(w, "Health check archived", "", selectedHealthCheckID)
+}
+
 func (h *Handler) createBackup(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		h.renderBackups(w, "", "Invalid form data")
@@ -1201,6 +1471,110 @@ func (h *Handler) createBackup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.renderBackups(w, "Backup created", "")
+}
+
+func (h *Handler) updateBackup(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		h.renderBackups(w, "", "backup id is required")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		h.renderBackups(w, "", "Invalid form data")
+		return
+	}
+
+	retention, err := parseRetention(r.FormValue("retention_days"))
+	if err != nil {
+		h.renderBackups(w, "", err.Error())
+		return
+	}
+
+	targetType := strings.TrimSpace(r.FormValue("target_type"))
+	compression := strings.TrimSpace(r.FormValue("compression"))
+	if compression == "" {
+		compression = "gzip"
+	}
+	includeFileStorage := r.FormValue("include_file_storage") == "true" || r.FormValue("include_file_storage") == "on"
+	if targetType != "local" && targetType != "s3" {
+		h.renderBackups(w, "", "target_type must be local or s3")
+		return
+	}
+
+	cronExpr := strings.TrimSpace(r.FormValue("cron_expr"))
+	if _, err := cron.ParseStandard(cronExpr); err != nil {
+		h.renderBackups(w, "", "invalid cron_expr")
+		return
+	}
+
+	timezone := strings.TrimSpace(r.FormValue("timezone"))
+	if timezone == "" {
+		timezone = "UTC"
+	}
+
+	item := models.Backup{
+		Name:               strings.TrimSpace(r.FormValue("name")),
+		ConnectionID:       strings.TrimSpace(r.FormValue("connection_id")),
+		CronExpr:           cronExpr,
+		Timezone:           timezone,
+		TargetType:         targetType,
+		LocalPath:          strings.TrimSpace(r.FormValue("local_path")),
+		RetentionDays:      retention,
+		Compression:        compression,
+		IncludeFileStorage: includeFileStorage,
+	}
+
+	if item.Name == "" || item.ConnectionID == "" {
+		h.renderBackups(w, "", "name and connection are required")
+		return
+	}
+	conn, err := h.repo.GetConnection(r.Context(), item.ConnectionID)
+	if err != nil {
+		h.renderBackups(w, "", "connection_id not found")
+		return
+	}
+	if strings.EqualFold(conn.Type, "convex") {
+		item.Compression = "none"
+	} else {
+		item.IncludeFileStorage = false
+		if item.Compression != "gzip" && item.Compression != "none" {
+			h.renderBackups(w, "", "compression must be gzip or none")
+			return
+		}
+	}
+	if item.TargetType == "local" && item.LocalPath == "" {
+		h.renderBackups(w, "", "local_path is required for local target")
+		return
+	}
+	if item.TargetType == "s3" {
+		remoteID := strings.TrimSpace(r.FormValue("remote_id"))
+		if remoteID == "" {
+			h.renderBackups(w, "", "remote_id is required for s3 target")
+			return
+		}
+		if _, err := h.repo.GetRemote(r.Context(), remoteID); err != nil {
+			h.renderBackups(w, "", "remote_id not found")
+			return
+		}
+		item.RemoteID = &remoteID
+	}
+
+	updated, err := h.repo.UpdateBackup(r.Context(), id, &item)
+	if err != nil {
+		h.renderBackups(w, "", err.Error())
+		return
+	}
+
+	if updated.Enabled {
+		if err := h.scheduler.Upsert(r.Context(), id); err != nil {
+			h.renderBackups(w, "", err.Error())
+			return
+		}
+	} else {
+		h.scheduler.Delete(id)
+	}
+
+	h.renderBackups(w, "Backup updated", "")
 }
 
 func (h *Handler) runBackupNow(w http.ResponseWriter, r *http.Request) {
@@ -1607,6 +1981,26 @@ func parseRetention(value string) (int, error) {
 		return 0, errors.New("retention_days must be >= 0")
 	}
 	return n, nil
+}
+
+func parsePositiveInt(value string, fallback int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func stringPtr(v string) *string {
+	return &v
+}
+
+func boolPtr(v bool) *bool {
+	return &v
+}
+
+func intPtr(v int) *int {
+	return &v
 }
 
 func redactConnections(items []models.Connection) {

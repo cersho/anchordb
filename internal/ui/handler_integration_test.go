@@ -2,6 +2,7 @@ package ui_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -266,5 +267,71 @@ func TestNotificationTestFromUI(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("expected webhook to be called")
+	}
+}
+
+func TestDeleteConnectionFromUI(t *testing.T) {
+	stack := testutil.NewStack(t)
+	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)
+	server := httptest.NewServer(h.Router())
+	t.Cleanup(server.Close)
+
+	conn := testutil.MustCreateConnection(t, stack.Repo, "ui-delete-connection")
+
+	res, err := http.Post(server.URL+"/connections/"+conn.ID+"/delete", "application/x-www-form-urlencoded", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("post delete connection: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if !strings.Contains(string(body), "Connection deleted") {
+		t.Fatalf("expected delete message, got %q", string(body))
+	}
+
+	items, err := stack.Repo.ListConnections(context.Background())
+	if err != nil {
+		t.Fatalf("list connections: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected 0 connections after delete, got %d", len(items))
+	}
+}
+
+func TestRunsPaginationFromUI(t *testing.T) {
+	stack := testutil.NewStack(t)
+	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)
+	server := httptest.NewServer(h.Router())
+	t.Cleanup(server.Close)
+
+	conn := testutil.MustCreateConnection(t, stack.Repo, "ui-runs-paging-connection")
+	backup := testutil.MustCreateLocalBackup(t, stack.Repo, "ui-runs-paging-backup", conn.ID, t.TempDir(), true)
+	for i := 0; i < 20; i++ {
+		testutil.MustCreateFinishedRun(t, stack.Repo, backup.ID, fmt.Sprintf("runs/%d.sql.gz", i))
+	}
+
+	res, err := http.Get(server.URL + "/runs/section?page=2")
+	if err != nil {
+		t.Fatalf("get runs section page 2: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if !strings.Contains(string(body), "Page 2") {
+		t.Fatalf("expected pagination marker, got %q", string(body))
 	}
 }

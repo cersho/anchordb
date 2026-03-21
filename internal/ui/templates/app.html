@@ -410,6 +410,27 @@
     .btn-danger:hover { background: rgba(239, 68, 68, 0.2); }
     .btn-sm { padding: 5px 10px; font-size: 12px; border-radius: var(--radius-sm); }
 
+    .icon-btn {
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-sub);
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .icon-btn:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+
+    .icon-btn i { width: 14px; height: 14px; }
+
     .flash {
       margin-bottom: 12px;
       border-radius: var(--radius-md);
@@ -437,6 +458,8 @@
     .badge.err { background: var(--red-dim); color: var(--red); }
     .badge.muted { background: var(--bg-overlay); color: var(--text-secondary); border: 1px solid var(--border-sub); }
     .badge.info { background: var(--accent-dim); color: var(--accent); }
+    .badge.enabled { background: var(--green-dim); color: var(--green); }
+    .badge.disabled { background: var(--red-dim); color: var(--red); }
 
     .conn-grid {
       display: grid;
@@ -492,7 +515,7 @@
     .table-wrap {
       border: 1px solid var(--border-sub);
       border-radius: var(--radius-lg);
-      overflow: hidden;
+      overflow: visible;
       background: var(--bg-surface);
     }
 
@@ -523,6 +546,81 @@
 
     tbody tr:last-child td { border-bottom: none; }
     tbody tr:hover { background: var(--bg-hover); }
+
+    .row-actions {
+      display: flex;
+      justify-content: flex-end;
+      position: relative;
+      z-index: 2;
+    }
+
+    .actions-menu {
+      position: relative;
+    }
+
+    .actions-menu[open] {
+      z-index: 40;
+    }
+
+    .actions-menu summary {
+      list-style: none;
+      cursor: pointer;
+    }
+
+    .actions-menu summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .actions-pop {
+      position: absolute;
+      right: 0;
+      top: calc(100% + 6px);
+      min-width: 150px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-sub);
+      border-radius: var(--radius-sm);
+      box-shadow: 0 14px 30px rgba(0, 0, 0, 0.35);
+      padding: 6px;
+      display: grid;
+      gap: 4px;
+      z-index: 30;
+    }
+
+    .menu-item {
+      width: 100%;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      text-decoration: none;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      font-family: var(--font-ui);
+      text-align: left;
+      padding: 7px 8px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .menu-item i {
+      width: 13px;
+      height: 13px;
+    }
+
+    .menu-item:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+
+    .menu-item.danger {
+      color: #fca5a5;
+    }
+
+    .menu-item.danger:hover {
+      background: var(--red-dim);
+      color: #fecaca;
+    }
 
     .mono { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); }
 
@@ -820,6 +918,19 @@
 
   {{if eq .CurrentPage "notifications"}}{{template "notifications_dialog" .}}{{end}}
   {{if eq .CurrentPage "schedules"}}{{template "schedule_dialog" .}}{{end}}
+  <dialog id="confirm-dialog" class="dialog-modal" style="width:min(440px,90vw);">
+    <div class="dialog-head">
+      <span data-confirm-title>Confirm action</span>
+      <button class="btn btn-ghost btn-sm" type="button" data-dialog-close>Close</button>
+    </div>
+    <div class="dialog-body">
+      <div data-confirm-body class="page-sub" style="margin-top:0;">This action cannot be undone.</div>
+    </div>
+    <div class="dialog-foot">
+      <button type="button" class="btn btn-secondary" data-dialog-close>Cancel</button>
+      <button type="button" class="btn btn-danger" data-confirm-run>Confirm</button>
+    </div>
+  </dialog>
 
   <script>
     (function () {
@@ -998,9 +1109,238 @@
         }
       }
 
+      function setConnectionCreateMode() {
+        var form = document.getElementById("connection-form");
+        if (!form) return;
+        form.reset();
+        form.setAttribute("hx-post", "/app/connections");
+        var title = document.getElementById("connection-dialog-title");
+        if (title) title.textContent = "Add Connection";
+        var submit = document.getElementById("connection-submit");
+        if (submit) submit.textContent = "Save Connection";
+        var hidden = form.querySelector("input[name='connection_id']");
+        if (hidden) hidden.value = "";
+        syncConnectionForm();
+      }
+
+      function setConnectionEditMode(trigger) {
+        var form = document.getElementById("connection-form");
+        if (!form || !trigger) return;
+        form.setAttribute("hx-post", "/app/connections/" + (trigger.getAttribute("data-connection-id") || "") + "/update");
+        var title = document.getElementById("connection-dialog-title");
+        if (title) title.textContent = "Edit Connection";
+        var submit = document.getElementById("connection-submit");
+        if (submit) submit.textContent = "Update Connection";
+        var hidden = form.querySelector("input[name='connection_id']");
+        if (hidden) hidden.value = trigger.getAttribute("data-connection-id") || "";
+        var typeEl = form.querySelector("select[name='type']");
+        if (typeEl) typeEl.value = trigger.getAttribute("data-connection-type") || "postgres";
+        var map = {
+          "name": "data-connection-name",
+          "host": "data-connection-host",
+          "port": "data-connection-port",
+          "database": "data-connection-database",
+          "username": "data-connection-username",
+          "ssl_mode": "data-connection-ssl-mode"
+        };
+        Object.keys(map).forEach(function (key) {
+          var field = form.querySelector("[name='" + key + "']");
+          if (!field) return;
+          field.value = trigger.getAttribute(map[key]) || "";
+        });
+        var pwd = form.querySelector("input[name='password']");
+        if (pwd) pwd.value = "";
+        syncConnectionForm();
+      }
+
+      function setRemoteCreateMode() {
+        var form = document.getElementById("remote-form");
+        if (!form) return;
+        form.reset();
+        form.setAttribute("hx-post", "/app/remotes");
+        var title = document.getElementById("remote-dialog-title");
+        if (title) title.textContent = "Add Remote";
+        var submit = document.getElementById("remote-submit");
+        if (submit) submit.textContent = "Save Remote";
+      }
+
+      function setRemoteEditMode(trigger) {
+        var form = document.getElementById("remote-form");
+        if (!form || !trigger) return;
+        form.setAttribute("hx-post", "/app/remotes/" + (trigger.getAttribute("data-remote-id") || "") + "/update");
+        var title = document.getElementById("remote-dialog-title");
+        if (title) title.textContent = "Edit Remote";
+        var submit = document.getElementById("remote-submit");
+        if (submit) submit.textContent = "Update Remote";
+        var map = {
+          "name": "data-remote-name",
+          "provider": "data-remote-provider",
+          "bucket": "data-remote-bucket",
+          "region": "data-remote-region",
+          "endpoint": "data-remote-endpoint",
+          "path_prefix": "data-remote-path-prefix"
+        };
+        Object.keys(map).forEach(function (key) {
+          var field = form.querySelector("[name='" + key + "']");
+          if (!field) return;
+          field.value = trigger.getAttribute(map[key]) || "";
+        });
+        ["access_key", "secret_key"].forEach(function (key) {
+          var field = form.querySelector("[name='" + key + "']");
+          if (field) field.value = "";
+        });
+      }
+
+      function setNotificationCreateMode() {
+        var form = document.getElementById("notification-form");
+        if (!form) return;
+        form.reset();
+        form.setAttribute("hx-post", "/app/notifications");
+        var title = document.getElementById("notification-dialog-title");
+        if (title) title.textContent = "Add Notification Destination";
+        var submit = document.getElementById("notification-submit");
+        if (submit) submit.textContent = "Save Destination";
+        syncNotificationForm();
+      }
+
+      function setNotificationEditMode(trigger) {
+        var form = document.getElementById("notification-form");
+        if (!form || !trigger) return;
+        form.setAttribute("hx-post", "/app/notifications/" + (trigger.getAttribute("data-notification-id") || "") + "/update");
+        var title = document.getElementById("notification-dialog-title");
+        if (title) title.textContent = "Edit Notification Destination";
+        var submit = document.getElementById("notification-submit");
+        if (submit) submit.textContent = "Update Destination";
+        var map = {
+          "name": "data-notification-name",
+          "type": "data-notification-type",
+          "smtp_host": "data-notification-smtp-host",
+          "smtp_username": "data-notification-smtp-username",
+          "smtp_from": "data-notification-smtp-from",
+          "smtp_to": "data-notification-smtp-to",
+          "smtp_security": "data-notification-smtp-security"
+        };
+        Object.keys(map).forEach(function (key) {
+          var field = form.querySelector("[name='" + key + "']");
+          if (!field) return;
+          field.value = trigger.getAttribute(map[key]) || "";
+        });
+        var smtpPort = trigger.getAttribute("data-notification-smtp-port") || "587";
+        var mode = form.querySelector("select[name='smtp_port_mode']");
+        var custom = form.querySelector("input[name='smtp_port_custom']");
+        if (mode) {
+          if (smtpPort === "25" || smtpPort === "465" || smtpPort === "587" || smtpPort === "2525") {
+            mode.value = smtpPort;
+            if (custom) custom.value = "";
+          } else {
+            mode.value = "other";
+            if (custom) custom.value = smtpPort;
+          }
+        }
+        var enabled = trigger.getAttribute("data-notification-enabled") === "true";
+        var enabledField = form.querySelector("input[name='enabled']");
+        if (enabledField) enabledField.checked = enabled;
+        var webhook = form.querySelector("input[name='discord_webhook_url']");
+        if (webhook) webhook.value = "";
+        var pass = form.querySelector("input[name='smtp_password']");
+        if (pass) pass.value = "";
+        syncNotificationForm();
+      }
+
+      function setScheduleCreateMode() {
+        var form = document.getElementById("backup-form");
+        if (!form) return;
+        form.reset();
+        form.setAttribute("hx-post", "/app/backups");
+        var title = document.getElementById("schedule-dialog-title");
+        if (title) title.textContent = "Add Schedule";
+        var submit = document.getElementById("schedule-submit");
+        if (submit) submit.textContent = "Create Schedule";
+      }
+
+      function setScheduleEditMode(trigger) {
+        var form = document.getElementById("backup-form");
+        if (!form || !trigger) return;
+        form.setAttribute("hx-post", "/app/backups/" + (trigger.getAttribute("data-schedule-id") || "") + "/update");
+        var title = document.getElementById("schedule-dialog-title");
+        if (title) title.textContent = "Edit Schedule";
+        var submit = document.getElementById("schedule-submit");
+        if (submit) submit.textContent = "Update Schedule";
+        var map = {
+          "name": "data-schedule-name",
+          "connection_id": "data-schedule-connection-id",
+          "cron_expr": "data-schedule-cron",
+          "timezone": "data-schedule-timezone",
+          "target_type": "data-schedule-target-type",
+          "remote_id": "data-schedule-remote-id",
+          "local_path": "data-schedule-local-path",
+          "retention_days": "data-schedule-retention-days",
+          "compression": "data-schedule-compression"
+        };
+        Object.keys(map).forEach(function (key) {
+          var field = form.querySelector("[name='" + key + "']");
+          if (!field) return;
+          field.value = trigger.getAttribute(map[key]) || "";
+        });
+      }
+
+      var pendingConfirm = null;
+
+      function openConfirmDialog(trigger) {
+        var dialog = document.getElementById("confirm-dialog");
+        if (!dialog) return;
+        var titleEl = dialog.querySelector("[data-confirm-title]");
+        var bodyEl = dialog.querySelector("[data-confirm-body]");
+        pendingConfirm = {
+          post: trigger.getAttribute("data-confirm-post") || "",
+          target: trigger.getAttribute("data-confirm-target") || "",
+          swap: trigger.getAttribute("data-confirm-swap") || "outerHTML"
+        };
+        if (titleEl) {
+          titleEl.textContent = trigger.getAttribute("data-confirm-title") || "Confirm action";
+        }
+        if (bodyEl) {
+          bodyEl.textContent = trigger.getAttribute("data-confirm-body") || "This action cannot be undone.";
+        }
+        openDialog("confirm-dialog");
+      }
+
+      function runConfirmedAction() {
+        if (!pendingConfirm || !pendingConfirm.post || !window.htmx) return;
+        window.htmx.ajax("POST", pendingConfirm.post, {
+          target: pendingConfirm.target || "body",
+          swap: pendingConfirm.swap || "outerHTML"
+        });
+        pendingConfirm = null;
+      }
+
       document.addEventListener("click", function (event) {
         var opener = event.target.closest("[data-dialog-open]");
         if (opener) {
+          if (opener.hasAttribute("data-connection-create")) {
+            setConnectionCreateMode();
+          }
+          if (opener.hasAttribute("data-connection-edit")) {
+            setConnectionEditMode(opener);
+          }
+          if (opener.hasAttribute("data-remote-create")) {
+            setRemoteCreateMode();
+          }
+          if (opener.hasAttribute("data-remote-edit")) {
+            setRemoteEditMode(opener);
+          }
+          if (opener.hasAttribute("data-notification-create")) {
+            setNotificationCreateMode();
+          }
+          if (opener.hasAttribute("data-notification-edit")) {
+            setNotificationEditMode(opener);
+          }
+          if (opener.hasAttribute("data-schedule-create")) {
+            setScheduleCreateMode();
+          }
+          if (opener.hasAttribute("data-schedule-edit")) {
+            setScheduleEditMode(opener);
+          }
           openDialog(opener.getAttribute("data-dialog-open"));
           return;
         }
@@ -1012,6 +1352,17 @@
         var parser = event.target.closest("[data-parse-connection]");
         if (parser) {
           applyConnectionString();
+          return;
+        }
+        var confirmer = event.target.closest("[data-confirm-post]");
+        if (confirmer) {
+          openConfirmDialog(confirmer);
+          return;
+        }
+        var confirmerRun = event.target.closest("[data-confirm-run]");
+        if (confirmerRun) {
+          runConfirmedAction();
+          closeDialog(confirmerRun);
           return;
         }
         if (event.target.tagName === "DIALOG") {
@@ -1050,6 +1401,16 @@
         if (event.target && event.target.matches("#notification-form select[name='smtp_port_mode']")) {
           syncNotificationForm();
         }
+      });
+
+      document.addEventListener("toggle", function (event) {
+        var menu = event.target;
+        if (!menu || !menu.classList || !menu.classList.contains("actions-menu") || !menu.open) return;
+        document.querySelectorAll(".actions-menu[open]").forEach(function (node) {
+          if (node !== menu) {
+            node.removeAttribute("open");
+          }
+        });
       });
 
       syncConnectionForm();
@@ -1115,7 +1476,7 @@
         <i data-lucide="refresh-cw"></i>
         Test All
       </button>
-      <button class="btn btn-primary btn-sm" type="button" data-dialog-open="connection-dialog">
+      <button class="btn btn-primary btn-sm" type="button" data-dialog-open="connection-dialog" data-connection-create="true">
         <i data-lucide="plus"></i>
         Add Connection
       </button>
@@ -1137,12 +1498,23 @@
       <div class="conn-host">{{connectionAddress .}}</div>
       <div class="conn-meta">
         <span>{{ago .UpdatedAt}}</span>
-        <button class="btn btn-ghost btn-sm" type="button" hx-post="/app/connections/{{.ID}}/test" hx-target="#connections-section" hx-swap="outerHTML">Test</button>
+        <details class="actions-menu">
+          <summary>
+            <span class="icon-btn">
+              <i data-lucide="ellipsis"></i>
+            </span>
+          </summary>
+          <div class="actions-pop">
+            <button class="menu-item" type="button" hx-post="/app/connections/{{.ID}}/test" hx-target="#connections-section" hx-swap="outerHTML"><i data-lucide="plug-zap"></i>Test</button>
+            <button class="menu-item" type="button" data-dialog-open="connection-dialog" data-connection-edit="true" data-connection-id="{{.ID}}" data-connection-name="{{.Name}}" data-connection-type="{{.Type}}" data-connection-host="{{.Host}}" data-connection-port="{{.Port}}" data-connection-database="{{.Database}}" data-connection-username="{{.Username}}" data-connection-ssl-mode="{{.SSLMode}}"><i data-lucide="pencil"></i>Edit</button>
+            <button class="menu-item danger" type="button" data-confirm-post="/app/connections/{{.ID}}/delete" data-confirm-target="#connections-section" data-confirm-title="Delete connection" data-confirm-body="Delete {{.Name}} and related health checks? This cannot be undone."><i data-lucide="trash-2"></i>Delete</button>
+          </div>
+        </details>
       </div>
     </div>
     {{end}}
 
-    <button type="button" class="conn-card" style="border-style:dashed;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-family:var(--font-mono);" data-dialog-open="connection-dialog">
+    <button type="button" class="conn-card" style="border-style:dashed;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-family:var(--font-mono);" data-dialog-open="connection-dialog" data-connection-create="true">
       + Add Connection
     </button>
   </div>
@@ -1152,11 +1524,12 @@
 
   <dialog id="connection-dialog" class="dialog-modal">
     <div class="dialog-head">
-      <span>Add Connection</span>
+      <span id="connection-dialog-title">Add Connection</span>
       <button class="btn btn-ghost btn-sm" type="button" data-dialog-close>Close</button>
     </div>
     <div class="dialog-body">
       <form id="connection-form" class="form-grid" hx-post="/app/connections" hx-target="#connections-section" hx-swap="outerHTML">
+        <input type="hidden" name="connection_id">
         <div class="full">
           <label>Connection String</label>
           <textarea name="connection_string" placeholder="postgres://user:pass@host:5432/dbname?sslmode=require"></textarea>
@@ -1209,7 +1582,7 @@
         </div>
         <div class="full dialog-foot" style="padding:0;border-top:none;justify-content:flex-end;">
           <button type="button" class="btn btn-secondary" hx-post="/app/connections/test" hx-include="#connection-form" hx-target="#connections-section" hx-swap="outerHTML">Test Connection</button>
-          <button type="submit" class="btn btn-primary">Save Connection</button>
+          <button type="submit" id="connection-submit" class="btn btn-primary">Save Connection</button>
         </div>
       </form>
     </div>
@@ -1225,7 +1598,7 @@
       <div class="page-sub">S3-compatible destinations for backup artifacts.</div>
     </div>
     <div class="page-actions">
-      <button class="btn btn-primary btn-sm" type="button" data-dialog-open="remote-dialog">Add Remote</button>
+      <button class="btn btn-primary btn-sm" type="button" data-dialog-open="remote-dialog" data-remote-create="true">Add Remote</button>
     </div>
   </div>
 
@@ -1242,6 +1615,7 @@
           <th>Region</th>
           <th>Endpoint</th>
           <th>Updated</th>
+          <th>Actions</th>
         </tr>
       </thead>
       <tbody>
@@ -1252,6 +1626,19 @@
           <td class="mono">{{.Region}}</td>
           <td class="mono">{{if .Endpoint}}{{.Endpoint}}{{else}}-{{end}}</td>
           <td class="mono">{{ago .UpdatedAt}}</td>
+          <td>
+            <div class="row-actions">
+              <details class="actions-menu">
+                <summary>
+                  <span class="icon-btn"><i data-lucide="ellipsis"></i></span>
+                </summary>
+                <div class="actions-pop">
+                  <button class="menu-item" type="button" data-dialog-open="remote-dialog" data-remote-edit="true" data-remote-id="{{.ID}}" data-remote-name="{{.Name}}" data-remote-provider="{{.Provider}}" data-remote-bucket="{{.Bucket}}" data-remote-region="{{.Region}}" data-remote-endpoint="{{.Endpoint}}" data-remote-path-prefix="{{.PathPrefix}}"><i data-lucide="pencil"></i>Edit</button>
+                  <button class="menu-item danger" type="button" data-confirm-post="/app/remotes/{{.ID}}/delete" data-confirm-target="#remotes-section" data-confirm-title="Delete remote" data-confirm-body="Delete remote {{.Name}}? This cannot be undone."><i data-lucide="trash-2"></i>Delete</button>
+                </div>
+              </details>
+            </div>
+          </td>
         </tr>
         {{end}}
       </tbody>
@@ -1263,11 +1650,12 @@
 
   <dialog id="remote-dialog" class="dialog-modal">
     <div class="dialog-head">
-      <span>Add Remote</span>
+      <span id="remote-dialog-title">Add Remote</span>
       <button class="btn btn-ghost btn-sm" type="button" data-dialog-close>Close</button>
     </div>
     <div class="dialog-body">
-      <form class="form-grid" hx-post="/app/remotes" hx-target="#remotes-section" hx-swap="outerHTML">
+      <form id="remote-form" class="form-grid" hx-post="/app/remotes" hx-target="#remotes-section" hx-swap="outerHTML">
+        <input type="hidden" name="remote_id">
         <div>
           <label>Name</label>
           <input name="name" placeholder="r2-primary" required>
@@ -1301,7 +1689,7 @@
           <input name="path_prefix" placeholder="backups/production/">
         </div>
         <div class="full dialog-foot" style="padding:0;border-top:none;">
-          <button type="submit" class="btn btn-primary">Save Remote</button>
+          <button type="submit" id="remote-submit" class="btn btn-primary">Save Remote</button>
         </div>
       </form>
     </div>
@@ -1321,7 +1709,7 @@
       <div class="page-sub">Create Discord and SMTP destinations, then bind them to schedules with success/failure rules.</div>
     </div>
     <div class="page-actions">
-      <button class="btn btn-primary btn-sm" type="button" data-dialog-open="notification-dialog">Add Destination</button>
+      <button class="btn btn-primary btn-sm" type="button" data-dialog-open="notification-dialog" data-notification-create="true">Add Destination</button>
     </div>
   </div>
 
@@ -1349,9 +1737,17 @@
               <td><span class="badge {{isEnabled .Enabled}}">{{isEnabled .Enabled}}</span></td>
               <td class="mono">{{ago .UpdatedAt}}</td>
               <td>
-                <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                  <button class="btn btn-secondary btn-sm" hx-post="/app/notifications/{{.ID}}/test?backup_id={{$.SelectedBackupID}}" hx-target="#notifications-section" hx-swap="outerHTML">Test</button>
-                  <button class="btn btn-danger btn-sm" hx-post="/app/notifications/{{.ID}}/delete?backup_id={{$.SelectedBackupID}}" hx-target="#notifications-section" hx-swap="outerHTML">Delete</button>
+                <div class="row-actions">
+                  <details class="actions-menu">
+                    <summary>
+                      <span class="icon-btn"><i data-lucide="ellipsis"></i></span>
+                    </summary>
+                    <div class="actions-pop">
+                      <button class="menu-item" hx-post="/app/notifications/{{.ID}}/test?backup_id={{$.SelectedBackupID}}" hx-target="#notifications-section" hx-swap="outerHTML"><i data-lucide="send"></i>Test</button>
+                      <button class="menu-item" type="button" data-dialog-open="notification-dialog" data-notification-edit="true" data-notification-id="{{.ID}}" data-notification-name="{{.Name}}" data-notification-type="{{.Type}}" data-notification-enabled="{{.Enabled}}" data-notification-smtp-host="{{.SMTPHost}}" data-notification-smtp-port="{{.SMTPPort}}" data-notification-smtp-username="{{.SMTPUsername}}" data-notification-smtp-from="{{.SMTPFrom}}" data-notification-smtp-to="{{.SMTPTo}}" data-notification-smtp-security="{{.SMTPSecurity}}"><i data-lucide="pencil"></i>Edit</button>
+                      <button class="menu-item danger" type="button" data-confirm-post="/app/notifications/{{.ID}}/delete?backup_id={{$.SelectedBackupID}}" data-confirm-target="#notifications-section" data-confirm-title="Delete destination" data-confirm-body="Delete notification destination {{.Name}}? This cannot be undone."><i data-lucide="trash-2"></i>Delete</button>
+                    </div>
+                  </details>
                 </div>
               </td>
             </tr>
@@ -1471,9 +1867,19 @@
               <td class="mono">{{if .LastCheckedAt}}{{ago .LastCheckedAt.UTC}}{{else}}-{{end}}</td>
               <td class="mono">{{index $.HealthNotificationCounts .ID}} bound</td>
               <td>
-                <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                  <button class="btn btn-secondary btn-sm" hx-post="/app/health-checks/{{.ID}}/run?health_check_id={{.ID}}" hx-target="#health-checks-section" hx-swap="outerHTML">Run now</button>
-                  <a class="btn btn-ghost btn-sm" href="/app/health-checks?health_check_id={{.ID}}" hx-get="/app/health-checks/section?health_check_id={{.ID}}" hx-target="#health-checks-section" hx-swap="outerHTML">Configure</a>
+                <div class="row-actions">
+                  <details class="actions-menu">
+                    <summary>
+                      <span class="icon-btn"><i data-lucide="ellipsis"></i></span>
+                    </summary>
+                    <div class="actions-pop">
+                      <button class="menu-item" hx-post="/app/health-checks/{{.ID}}/run?health_check_id={{.ID}}" hx-target="#health-checks-section" hx-swap="outerHTML"><i data-lucide="play"></i>Run now</button>
+                      <a class="menu-item" href="/app/health-checks?health_check_id={{.ID}}" hx-get="/app/health-checks/section?health_check_id={{.ID}}" hx-target="#health-checks-section" hx-swap="outerHTML"><i data-lucide="settings-2"></i>Configure</a>
+                      {{if .Enabled}}
+                      <button class="menu-item danger" type="button" data-confirm-post="/app/health-checks/{{.ID}}/archive?health_check_id={{$.SelectedHealthCheckID}}" data-confirm-target="#health-checks-section" data-confirm-title="Archive health check" data-confirm-body="Archive check for {{.Connection.Name}}? This will disable monitoring for it."><i data-lucide="archive"></i>Archive</button>
+                      {{end}}
+                    </div>
+                  </details>
                 </div>
               </td>
             </tr>
@@ -1590,7 +1996,7 @@
       <div class="page-sub">Configure cadence, retention, and execution controls.</div>
     </div>
     <div class="page-actions">
-      <button class="btn btn-primary btn-sm" type="button" data-dialog-open="schedule-dialog">Add Schedule</button>
+      <button class="btn btn-primary btn-sm" type="button" data-dialog-open="schedule-dialog" data-schedule-create="true">Add Schedule</button>
     </div>
   </div>
 
@@ -1623,16 +2029,23 @@
           <td><span class="badge {{isEnabled .Enabled}}">{{isEnabled .Enabled}}</span></td>
           <td class="mono"><a href="/app/notifications?backup_id={{.ID}}">{{index $.BackupNotificationCounts .ID}} bound</a></td>
           <td>
-            <div style="display:flex;flex-wrap:wrap;gap:6px;">
-              <button class="btn btn-secondary btn-sm" hx-post="/app/backups/{{.ID}}/run" hx-target="#schedules-section" hx-swap="outerHTML">Run now</button>
-              <a class="btn btn-ghost btn-sm" href="/app/runs">View runs</a>
-              <button class="btn btn-ghost btn-sm" type="button">Restore</button>
-              {{if .Enabled}}
-              <button class="btn btn-ghost btn-sm" hx-post="/app/backups/{{.ID}}/toggle" hx-vals='{"enabled":"false"}' hx-target="#schedules-section" hx-swap="outerHTML">Disable</button>
-              {{else}}
-              <button class="btn btn-ghost btn-sm" hx-post="/app/backups/{{.ID}}/toggle" hx-vals='{"enabled":"true"}' hx-target="#schedules-section" hx-swap="outerHTML">Enable</button>
-              {{end}}
-              <button class="btn btn-danger btn-sm" hx-post="/app/backups/{{.ID}}/delete" hx-target="#schedules-section" hx-swap="outerHTML">Delete</button>
+            <div class="row-actions">
+              <details class="actions-menu">
+                <summary>
+                  <span class="icon-btn"><i data-lucide="ellipsis"></i></span>
+                </summary>
+                <div class="actions-pop">
+                  <button class="menu-item" hx-post="/app/backups/{{.ID}}/run" hx-target="#schedules-section" hx-swap="outerHTML"><i data-lucide="play"></i>Run now</button>
+                  <a class="menu-item" href="/app/runs"><i data-lucide="list"></i>View runs</a>
+                  <button class="menu-item" type="button" data-dialog-open="schedule-dialog" data-schedule-edit="true" data-schedule-id="{{.ID}}" data-schedule-name="{{.Name}}" data-schedule-connection-id="{{.ConnectionID}}" data-schedule-cron="{{.CronExpr}}" data-schedule-timezone="{{.Timezone}}" data-schedule-target-type="{{.TargetType}}" data-schedule-remote-id="{{if .RemoteID}}{{.RemoteID}}{{end}}" data-schedule-local-path="{{.LocalPath}}" data-schedule-retention-days="{{.RetentionDays}}" data-schedule-compression="{{.Compression}}"><i data-lucide="pencil"></i>Edit</button>
+                  {{if .Enabled}}
+                  <button class="menu-item" hx-post="/app/backups/{{.ID}}/toggle" hx-vals='{"enabled":"false"}' hx-target="#schedules-section" hx-swap="outerHTML"><i data-lucide="pause"></i>Disable</button>
+                  {{else}}
+                  <button class="menu-item" hx-post="/app/backups/{{.ID}}/toggle" hx-vals='{"enabled":"true"}' hx-target="#schedules-section" hx-swap="outerHTML"><i data-lucide="play"></i>Enable</button>
+                  {{end}}
+                  <button class="menu-item danger" type="button" data-confirm-post="/app/backups/{{.ID}}/delete" data-confirm-target="#schedules-section" data-confirm-title="Delete schedule" data-confirm-body="Delete schedule {{.Name}}? This cannot be undone."><i data-lucide="trash-2"></i>Delete</button>
+                </div>
+              </details>
             </div>
           </td>
         </tr>
@@ -1650,11 +2063,12 @@
 {{define "notifications_dialog"}}
 <dialog id="notification-dialog" class="dialog-modal">
   <div class="dialog-head">
-    <span>Add Notification Destination</span>
+    <span id="notification-dialog-title">Add Notification Destination</span>
     <button class="btn btn-ghost btn-sm" type="button" data-dialog-close>Close</button>
   </div>
   <div class="dialog-body">
     <form id="notification-form" class="form-grid" hx-post="/app/notifications" hx-target="#notifications-section" hx-swap="outerHTML">
+      <input type="hidden" name="notification_id">
       <input type="hidden" name="backup_id" value="{{.SelectedBackupID}}">
       <div>
         <label>Name</label>
@@ -1724,7 +2138,7 @@
       </div>
 
       <div class="full dialog-foot" style="padding:0;border-top:none;justify-content:flex-end;">
-        <button type="submit" class="btn btn-primary">Save Destination</button>
+        <button type="submit" id="notification-submit" class="btn btn-primary">Save Destination</button>
       </div>
     </form>
   </div>
@@ -1733,12 +2147,13 @@
 
 {{define "schedule_dialog"}}
 <dialog id="schedule-dialog" class="dialog-modal">
-  <div class="dialog-head">
-    <span>Add Schedule</span>
-    <button class="btn btn-ghost btn-sm" type="button" data-dialog-close>Close</button>
-  </div>
+    <div class="dialog-head">
+      <span id="schedule-dialog-title">Add Schedule</span>
+      <button class="btn btn-ghost btn-sm" type="button" data-dialog-close>Close</button>
+    </div>
   <div class="dialog-body">
-    <form id="backup-form" class="form-grid" hx-post="/app/backups" hx-target="#schedules-section" hx-swap="outerHTML">
+      <form id="backup-form" class="form-grid" hx-post="/app/backups" hx-target="#schedules-section" hx-swap="outerHTML">
+        <input type="hidden" name="backup_id">
       <div>
         <label>Name</label>
         <input name="name" placeholder="production-every-6h" required>
@@ -1787,10 +2202,10 @@
           <option value="none">none</option>
         </select>
       </div>
-      <div class="full dialog-foot" style="padding:0;border-top:none;">
-        <button type="submit" class="btn btn-primary">Create Schedule</button>
-      </div>
-    </form>
+        <div class="full dialog-foot" style="padding:0;border-top:none;">
+          <button type="submit" id="schedule-submit" class="btn btn-primary">Create Schedule</button>
+        </div>
+      </form>
   </div>
 </dialog>
 {{end}}
@@ -1809,9 +2224,9 @@
 
 {{define "runs_section"}}
 {{if .SelectedRunID}}
-<section id="runs-section" class="page-block" hx-get="/app/runs/section?run_id={{.SelectedRunID}}" hx-trigger="every 8s [!document.querySelector('dialog[open]')]" hx-target="this" hx-swap="outerHTML">
+<section id="runs-section" class="page-block" hx-get="/app/runs/section?run_id={{.SelectedRunID}}&page={{.RunsPage}}" hx-trigger="every 8s [!document.querySelector('dialog[open]')]" hx-target="this" hx-swap="outerHTML">
 {{else}}
-<section id="runs-section" class="page-block" hx-get="/app/runs/section" hx-trigger="every 8s [!document.querySelector('dialog[open]')]" hx-target="this" hx-swap="outerHTML">
+<section id="runs-section" class="page-block" hx-get="/app/runs/section?page={{.RunsPage}}" hx-trigger="every 8s [!document.querySelector('dialog[open]')]" hx-target="this" hx-swap="outerHTML">
 {{end}}
   {{if .RunsErr}}<div class="flash err">{{.RunsErr}}</div>{{end}}
 
@@ -1820,7 +2235,7 @@
     <div class="run-list">
       <div class="run-list-head">Recent Runs</div>
       {{range .RunItems}}
-      <a class="run-item {{if eq $.SelectedRunID .ID}}active{{end}}" href="/app/runs?run_id={{.ID}}" hx-get="/app/runs/section?run_id={{.ID}}" hx-target="#runs-section" hx-swap="outerHTML">
+      <a class="run-item {{if eq $.SelectedRunID .ID}}active{{end}}" href="/app/runs?run_id={{.ID}}&page={{$.RunsPage}}" hx-get="/app/runs/section?run_id={{.ID}}&page={{$.RunsPage}}" hx-target="#runs-section" hx-swap="outerHTML">
         <div class="run-item-row">
           <span class="run-item-name">{{if .BackupName}}{{.BackupName}}{{else}}backup{{end}}</span>
           <span class="badge {{runTone .Status}}">{{.Status}}</span>
@@ -1828,6 +2243,11 @@
         <div class="run-item-meta">{{.StartedAt.Format "2006-01-02 15:04:05"}} UTC - {{duration .StartedAt .FinishedAt}}</div>
       </a>
       {{end}}
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-top:1px solid var(--border-dim);">
+        <button class="btn btn-ghost btn-sm" {{if not .RunsHasPrev}}disabled{{end}} hx-get="/app/runs/section?page={{if .RunsHasPrev}}{{dec .RunsPage}}{{else}}{{.RunsPage}}{{end}}" hx-target="#runs-section" hx-swap="outerHTML">Prev</button>
+        <span class="mono">Page {{.RunsPage}}</span>
+        <button class="btn btn-ghost btn-sm" {{if not .RunsHasNext}}disabled{{end}} hx-get="/app/runs/section?page={{if .RunsHasNext}}{{inc .RunsPage}}{{else}}{{.RunsPage}}{{end}}" hx-target="#runs-section" hx-swap="outerHTML">Next</button>
+      </div>
     </div>
 
     {{if .HasSelectedRun}}
