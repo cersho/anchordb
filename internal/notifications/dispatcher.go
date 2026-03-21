@@ -308,8 +308,12 @@ func formatHealthMessage(check models.HealthCheck, event string) string {
 	b.WriteString("AnchorDB health check ")
 	b.WriteString(state)
 	b.WriteString("\n")
+	connectionName := strings.TrimSpace(check.Connection.Name)
+	if connectionName == "" {
+		connectionName = check.ConnectionID
+	}
 	b.WriteString("- Connection: ")
-	b.WriteString(check.Connection.Name)
+	b.WriteString(connectionName)
 	b.WriteString("\n")
 	b.WriteString("- Type: ")
 	b.WriteString(check.Connection.Type)

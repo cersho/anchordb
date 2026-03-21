@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"anchordb/internal/config"
@@ -19,6 +20,7 @@ type Monitor struct {
 	sem      chan struct{}
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+	wg       sync.WaitGroup
 }
 
 func NewMonitor(cfg config.Config, repo *repository.Repository) *Monitor {
@@ -70,6 +72,7 @@ func (m *Monitor) Start(ctx context.Context) {
 func (m *Monitor) Stop() {
 	close(m.stopCh)
 	<-m.doneCh
+	m.wg.Wait()
 }
 
 func (m *Monitor) processDue(ctx context.Context) {
@@ -103,8 +106,10 @@ func (m *Monitor) processDue(ctx context.Context) {
 		if !claimed {
 			continue
 		}
+		m.wg.Add(1)
 		m.sem <- struct{}{}
 		go func() {
+			defer m.wg.Done()
 			defer func() { <-m.sem }()
 			m.runCheck(context.Background(), itemCopy)
 		}()

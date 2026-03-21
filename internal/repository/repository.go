@@ -307,10 +307,15 @@ func (r *Repository) CreateNotification(ctx context.Context, n *models.Notificat
 	if err := r.encryptNotificationSecrets(&copy); err != nil {
 		return err
 	}
-	if err := r.db.WithContext(ctx).Create(&copy).Error; err != nil {
-		return err
-	}
-	if err := r.attachNotificationToAllHealthChecks(ctx, copy.ID); err != nil {
+	if err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&copy).Error; err != nil {
+			return err
+		}
+		if err := r.attachNotificationToAllHealthChecksTx(ctx, tx, copy.ID); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	*n = copy
@@ -915,8 +920,12 @@ func (r *Repository) seedDefaultHealthCheckNotifications(ctx context.Context, he
 }
 
 func (r *Repository) attachNotificationToAllHealthChecks(ctx context.Context, notificationID string) error {
+	return r.attachNotificationToAllHealthChecksTx(ctx, r.db.WithContext(ctx), notificationID)
+}
+
+func (r *Repository) attachNotificationToAllHealthChecksTx(ctx context.Context, db *gorm.DB, notificationID string) error {
 	var checks []models.HealthCheck
-	if err := r.db.WithContext(ctx).Select("id").Find(&checks).Error; err != nil {
+	if err := db.WithContext(ctx).Select("id").Find(&checks).Error; err != nil {
 		return err
 	}
 	if len(checks) == 0 {
@@ -936,7 +945,7 @@ func (r *Repository) attachNotificationToAllHealthChecks(ctx context.Context, no
 			"updated_at":      now,
 		})
 	}
-	return r.db.WithContext(ctx).Table("health_check_notifications").Create(items).Error
+	return db.WithContext(ctx).Table("health_check_notifications").Create(items).Error
 }
 
 func validateNotificationDestination(n models.NotificationDestination) error {
