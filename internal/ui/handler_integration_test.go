@@ -270,6 +270,72 @@ func TestNotificationTestFromUI(t *testing.T) {
 	}
 }
 
+func TestUpdateSMTPNotificationFromUIKeepsPasswordWhenBlank(t *testing.T) {
+	stack := testutil.NewStack(t)
+	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)
+	server := httptest.NewServer(h.Router())
+	t.Cleanup(server.Close)
+
+	createForm := url.Values{}
+	createForm.Set("name", "ops-smtp")
+	createForm.Set("type", "smtp")
+	createForm.Set("smtp_host", "smtp.example.com")
+	createForm.Set("smtp_port_mode", "587")
+	createForm.Set("smtp_username", "alerts@example.com")
+	createForm.Set("smtp_password", "initial-secret")
+	createForm.Set("smtp_from", "alerts@example.com")
+	createForm.Set("smtp_to", "team@example.com")
+	createForm.Set("smtp_security", "starttls")
+
+	createRes, err := http.PostForm(server.URL+"/notifications", createForm)
+	if err != nil {
+		t.Fatalf("post smtp notification form: %v", err)
+	}
+	defer func() { _ = createRes.Body.Close() }()
+	if createRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", createRes.StatusCode)
+	}
+
+	notifications, err := stack.Repo.ListNotifications(context.Background())
+	if err != nil {
+		t.Fatalf("list notifications: %v", err)
+	}
+	if len(notifications) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(notifications))
+	}
+
+	updateForm := url.Values{}
+	updateForm.Set("name", "ops-smtp-updated")
+	updateForm.Set("type", "smtp")
+	updateForm.Set("smtp_host", "smtp.example.com")
+	updateForm.Set("smtp_port_mode", "587")
+	updateForm.Set("smtp_username", "alerts@example.com")
+	updateForm.Set("smtp_password", "")
+	updateForm.Set("smtp_from", "alerts@example.com")
+	updateForm.Set("smtp_to", "team@example.com")
+	updateForm.Set("smtp_security", "starttls")
+
+	updateRes, err := http.PostForm(server.URL+"/notifications/"+notifications[0].ID+"/update", updateForm)
+	if err != nil {
+		t.Fatalf("post update smtp notification form: %v", err)
+	}
+	defer func() { _ = updateRes.Body.Close() }()
+	if updateRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", updateRes.StatusCode)
+	}
+
+	updated, err := stack.Repo.GetNotification(context.Background(), notifications[0].ID)
+	if err != nil {
+		t.Fatalf("get updated notification: %v", err)
+	}
+	if updated.Name != "ops-smtp-updated" {
+		t.Fatalf("expected updated name, got %q", updated.Name)
+	}
+	if updated.SMTPPassword != "initial-secret" {
+		t.Fatalf("expected smtp password to remain unchanged")
+	}
+}
+
 func TestDeleteConnectionFromUI(t *testing.T) {
 	stack := testutil.NewStack(t)
 	h := ui.NewHandler(stack.Repo, stack.Scheduler, stack.Config)

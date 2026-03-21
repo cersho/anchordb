@@ -1099,7 +1099,7 @@ func (h *Handler) updateNotification(w http.ResponseWriter, r *http.Request) {
 		smtpPort = port
 	}
 
-	if _, err := h.repo.UpdateNotification(r.Context(), id, repository.NotificationPatch{
+	patch := repository.NotificationPatch{
 		Name:              stringPtr(name),
 		Type:              stringPtr(notificationType),
 		Enabled:           boolPtr(enabled),
@@ -1107,11 +1107,15 @@ func (h *Handler) updateNotification(w http.ResponseWriter, r *http.Request) {
 		SMTPHost:          stringPtr(smtpHost),
 		SMTPPort:          intPtr(smtpPort),
 		SMTPUsername:      stringPtr(smtpUsername),
-		SMTPPassword:      stringPtr(smtpPassword),
 		SMTPFrom:          stringPtr(smtpFrom),
 		SMTPTo:            stringPtr(smtpTo),
 		SMTPSecurity:      stringPtr(smtpSecurity),
-	}); err != nil {
+	}
+	if strings.TrimSpace(smtpPassword) != "" {
+		patch.SMTPPassword = stringPtr(smtpPassword)
+	}
+
+	if _, err := h.repo.UpdateNotification(r.Context(), id, patch); err != nil {
 		h.renderNotifications(w, "", err.Error(), selectedBackupID)
 		return
 	}

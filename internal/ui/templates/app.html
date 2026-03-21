@@ -1200,6 +1200,8 @@
         if (title) title.textContent = "Add Notification Destination";
         var submit = document.getElementById("notification-submit");
         if (submit) submit.textContent = "Save Destination";
+        var pass = form.querySelector("input[name='smtp_password']");
+        if (pass) pass.setAttribute("placeholder", "Required when username is set");
         syncNotificationForm();
       }
 
@@ -1243,7 +1245,10 @@
         var webhook = form.querySelector("input[name='discord_webhook_url']");
         if (webhook) webhook.value = "";
         var pass = form.querySelector("input[name='smtp_password']");
-        if (pass) pass.value = "";
+        if (pass) {
+          pass.value = "";
+          pass.setAttribute("placeholder", "Leave blank to keep existing password");
+        }
         syncNotificationForm();
       }
 
@@ -2111,7 +2116,7 @@
       </div>
       <div class="notif-smtp-only">
         <label>SMTP Password</label>
-        <input name="smtp_password" type="password">
+        <input name="smtp_password" type="password" placeholder="Required when username is set">
       </div>
       <div class="notif-smtp-only">
         <label>SMTP From</label>
