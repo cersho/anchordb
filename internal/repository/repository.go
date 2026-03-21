@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -16,6 +17,20 @@ import (
 type Repository struct {
 	db     *gorm.DB
 	crypto *crypto.Service
+}
+
+type NotificationPatch struct {
+	Name              *string
+	Type              *string
+	Enabled           *bool
+	DiscordWebhookURL *string
+	SMTPHost          *string
+	SMTPPort          *int
+	SMTPUsername      *string
+	SMTPPassword      *string
+	SMTPFrom          *string
+	SMTPTo            *string
+	SMTPSecurity      *string
 }
 
 func New(db *gorm.DB, cryptoSvc *crypto.Service) *Repository {
@@ -243,6 +258,295 @@ func (r *Repository) ListRemotes(ctx context.Context) ([]models.Remote, error) {
 		}
 	}
 	return items, nil
+}
+
+func (r *Repository) CreateNotification(ctx context.Context, n *models.NotificationDestination) error {
+	if n.ID == "" {
+		n.ID = uuid.NewString()
+	}
+	n.Type = strings.ToLower(strings.TrimSpace(n.Type))
+	if n.SMTPPort == 0 {
+		n.SMTPPort = 587
+	}
+	n.SMTPSecurity = normalizeSMTPSecurityValue(n.SMTPSecurity)
+	if err := validateNotificationDestination(*n); err != nil {
+		return err
+	}
+
+	copy := *n
+	if err := r.encryptNotificationSecrets(&copy); err != nil {
+		return err
+	}
+	if err := r.db.WithContext(ctx).Create(&copy).Error; err != nil {
+		return err
+	}
+	*n = copy
+	return r.decryptNotification(n)
+}
+
+func (r *Repository) UpdateNotification(ctx context.Context, id string, patch NotificationPatch) (models.NotificationDestination, error) {
+	existing, err := r.getNotificationRaw(ctx, id)
+	if err != nil {
+		return models.NotificationDestination{}, err
+	}
+	if err := r.decryptNotification(&existing); err != nil {
+		return models.NotificationDestination{}, err
+	}
+
+	if patch.Name != nil {
+		existing.Name = strings.TrimSpace(*patch.Name)
+	}
+	if patch.Type != nil {
+		existing.Type = strings.ToLower(strings.TrimSpace(*patch.Type))
+	}
+	if patch.Enabled != nil {
+		existing.Enabled = *patch.Enabled
+	}
+	if patch.DiscordWebhookURL != nil {
+		existing.DiscordWebhookURL = strings.TrimSpace(*patch.DiscordWebhookURL)
+	}
+	if patch.SMTPHost != nil {
+		existing.SMTPHost = strings.TrimSpace(*patch.SMTPHost)
+	}
+	if patch.SMTPPort != nil {
+		existing.SMTPPort = *patch.SMTPPort
+	}
+	if patch.SMTPUsername != nil {
+		existing.SMTPUsername = strings.TrimSpace(*patch.SMTPUsername)
+	}
+	if patch.SMTPPassword != nil {
+		existing.SMTPPassword = *patch.SMTPPassword
+	}
+	if patch.SMTPFrom != nil {
+		existing.SMTPFrom = strings.TrimSpace(*patch.SMTPFrom)
+	}
+	if patch.SMTPTo != nil {
+		existing.SMTPTo = strings.TrimSpace(*patch.SMTPTo)
+	}
+	if patch.SMTPSecurity != nil {
+		existing.SMTPSecurity = normalizeSMTPSecurityValue(*patch.SMTPSecurity)
+	}
+
+	if existing.SMTPPort == 0 {
+		existing.SMTPPort = 587
+	}
+	existing.SMTPSecurity = normalizeSMTPSecurityValue(existing.SMTPSecurity)
+	if err := validateNotificationDestination(existing); err != nil {
+		return models.NotificationDestination{}, err
+	}
+
+	saved := existing
+	if err := r.encryptNotificationSecrets(&saved); err != nil {
+		return models.NotificationDestination{}, err
+	}
+	if err := r.db.WithContext(ctx).Save(&saved).Error; err != nil {
+		return models.NotificationDestination{}, err
+	}
+	if err := r.decryptNotification(&saved); err != nil {
+		return models.NotificationDestination{}, err
+	}
+	return saved, nil
+}
+
+func (r *Repository) DeleteNotification(ctx context.Context, id string) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&models.BackupNotification{}, "notification_id = ?", id).Error; err != nil {
+			return err
+		}
+		res := tx.Delete(&models.NotificationDestination{}, "id = ?", id)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return nil
+	})
+}
+
+func (r *Repository) GetNotification(ctx context.Context, id string) (models.NotificationDestination, error) {
+	n, err := r.getNotificationRaw(ctx, id)
+	if err != nil {
+		return models.NotificationDestination{}, err
+	}
+	if err := r.decryptNotification(&n); err != nil {
+		return models.NotificationDestination{}, err
+	}
+	return n, nil
+}
+
+func (r *Repository) ListNotifications(ctx context.Context) ([]models.NotificationDestination, error) {
+	var items []models.NotificationDestination
+	err := r.db.WithContext(ctx).Order("created_at desc").Find(&items).Error
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if decErr := r.decryptNotification(&items[i]); decErr != nil {
+			return nil, decErr
+		}
+	}
+	return items, nil
+}
+
+func (r *Repository) getNotificationRaw(ctx context.Context, id string) (models.NotificationDestination, error) {
+	var n models.NotificationDestination
+	err := r.db.WithContext(ctx).First(&n, "id = ?", id).Error
+	return n, err
+}
+
+func (r *Repository) ListBackupNotifications(ctx context.Context, backupID string) ([]models.BackupNotification, error) {
+	var items []models.BackupNotification
+	err := r.db.WithContext(ctx).
+		Where("backup_id = ?", backupID).
+		Preload("Notification").
+		Order("created_at asc").
+		Find(&items).Error
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if items[i].Notification.ID != "" {
+			if decErr := r.decryptNotification(&items[i].Notification); decErr != nil {
+				return nil, decErr
+			}
+		}
+	}
+	return items, nil
+}
+
+func (r *Repository) SetBackupNotifications(ctx context.Context, backupID string, bindings []models.BackupNotification) ([]models.BackupNotification, error) {
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var backup models.Backup
+		if err := tx.First(&backup, "id = ?", backupID).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Delete(&models.BackupNotification{}, "backup_id = ?", backupID).Error; err != nil {
+			return err
+		}
+
+		seen := make(map[string]struct{}, len(bindings))
+		for _, binding := range bindings {
+			notificationID := strings.TrimSpace(binding.NotificationID)
+			if notificationID == "" {
+				return errors.New("notification_id is required")
+			}
+			if _, ok := seen[notificationID]; ok {
+				return fmt.Errorf("duplicate notification_id: %s", notificationID)
+			}
+			seen[notificationID] = struct{}{}
+			if !binding.OnSuccess && !binding.OnFailure {
+				return fmt.Errorf("notification %s must enable on_success or on_failure", notificationID)
+			}
+
+			var destination models.NotificationDestination
+			if err := tx.First(&destination, "id = ?", notificationID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("notification_id not found: %s", notificationID)
+				}
+				return err
+			}
+
+			now := time.Now().UTC()
+			item := map[string]any{
+				"id":              uuid.NewString(),
+				"backup_id":       backupID,
+				"notification_id": notificationID,
+				"on_success":      binding.OnSuccess,
+				"on_failure":      binding.OnFailure,
+				"enabled":         binding.Enabled,
+				"created_at":      now,
+				"updated_at":      now,
+			}
+
+			if err := tx.Table("backup_notifications").Create(item).Error; err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return r.ListBackupNotifications(ctx, backupID)
+}
+
+func (r *Repository) ListNotificationDestinationsForEvent(ctx context.Context, backupID, event string) ([]models.NotificationDestination, error) {
+	column := "on_failure"
+	if strings.EqualFold(strings.TrimSpace(event), "success") {
+		column = "on_success"
+	}
+
+	var bindings []models.BackupNotification
+	err := r.db.WithContext(ctx).
+		Where("backup_id = ?", backupID).
+		Where("enabled = ?", true).
+		Where(column+" = ?", true).
+		Preload("Notification", "enabled = ?", true).
+		Find(&bindings).Error
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]models.NotificationDestination, 0, len(bindings))
+	for _, binding := range bindings {
+		if binding.Notification.ID == "" {
+			continue
+		}
+		if decErr := r.decryptNotification(&binding.Notification); decErr != nil {
+			return nil, decErr
+		}
+		items = append(items, binding.Notification)
+	}
+	return items, nil
+}
+
+func validateNotificationDestination(n models.NotificationDestination) error {
+	if strings.TrimSpace(n.Name) == "" {
+		return errors.New("name is required")
+	}
+	kind := strings.ToLower(strings.TrimSpace(n.Type))
+	if kind != "discord" && kind != "smtp" {
+		return errors.New("type must be discord or smtp")
+	}
+	if kind == "discord" {
+		if strings.TrimSpace(n.DiscordWebhookURL) == "" {
+			return errors.New("discord_webhook_url is required for discord notifications")
+		}
+		return nil
+	}
+
+	if strings.TrimSpace(n.SMTPHost) == "" || strings.TrimSpace(n.SMTPFrom) == "" || strings.TrimSpace(n.SMTPTo) == "" {
+		return errors.New("smtp_host, smtp_from, and smtp_to are required for smtp notifications")
+	}
+	if n.SMTPPort <= 0 || n.SMTPPort > 65535 {
+		return errors.New("smtp_port must be between 1 and 65535")
+	}
+	security := strings.ToLower(strings.TrimSpace(n.SMTPSecurity))
+	if security != "starttls" && security != "ssl_tls" && security != "none" {
+		return errors.New("smtp_security must be starttls, ssl_tls, or none")
+	}
+	if strings.TrimSpace(n.SMTPUsername) != "" && strings.TrimSpace(n.SMTPPassword) == "" {
+		return errors.New("smtp_password is required when smtp_username is set")
+	}
+	return nil
+}
+
+func normalizeSMTPSecurityValue(raw string) string {
+	security := strings.ToLower(strings.TrimSpace(raw))
+	switch security {
+	case "", "starttls":
+		return "starttls"
+	case "ssl", "tls", "ssl_tls", "smtps", "implicit_tls", "implicit-tls":
+		return "ssl_tls"
+	case "none", "plain", "insecure":
+		return "none"
+	default:
+		return security
+	}
 }
 
 func (r *Repository) CreateBackup(ctx context.Context, b *models.Backup) error {
@@ -519,5 +823,41 @@ func (r *Repository) decryptRemote(rem *models.Remote) error {
 	}
 	rem.AccessKey = access
 	rem.SecretKey = secret
+	return nil
+}
+
+func (r *Repository) encryptNotificationSecrets(n *models.NotificationDestination) error {
+	if strings.TrimSpace(n.DiscordWebhookURL) != "" {
+		enc, err := r.crypto.EncryptString(n.DiscordWebhookURL)
+		if err != nil {
+			return err
+		}
+		n.DiscordWebhookURL = enc
+	}
+	if strings.TrimSpace(n.SMTPPassword) != "" {
+		enc, err := r.crypto.EncryptString(n.SMTPPassword)
+		if err != nil {
+			return err
+		}
+		n.SMTPPassword = enc
+	}
+	return nil
+}
+
+func (r *Repository) decryptNotification(n *models.NotificationDestination) error {
+	if strings.TrimSpace(n.DiscordWebhookURL) != "" {
+		plain, err := r.crypto.DecryptString(n.DiscordWebhookURL)
+		if err != nil {
+			return err
+		}
+		n.DiscordWebhookURL = plain
+	}
+	if strings.TrimSpace(n.SMTPPassword) != "" {
+		plain, err := r.crypto.DecryptString(n.SMTPPassword)
+		if err != nil {
+			return err
+		}
+		n.SMTPPassword = plain
+	}
 	return nil
 }

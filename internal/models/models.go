@@ -63,3 +63,33 @@ type BackupRun struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
 }
+
+type NotificationDestination struct {
+	ID                string    `gorm:"primaryKey;size:36" json:"id"`
+	Name              string    `gorm:"size:255;not null" json:"name"`
+	Type              string    `gorm:"size:32;not null" json:"type"`
+	Enabled           bool      `gorm:"not null;default:true" json:"enabled"`
+	DiscordWebhookURL string    `gorm:"size:2048" json:"discord_webhook_url"`
+	SMTPHost          string    `gorm:"size:255" json:"smtp_host"`
+	SMTPPort          int       `gorm:"not null;default:587" json:"smtp_port"`
+	SMTPUsername      string    `gorm:"size:255" json:"smtp_username"`
+	SMTPPassword      string    `gorm:"size:1024" json:"smtp_password"`
+	SMTPFrom          string    `gorm:"size:255" json:"smtp_from"`
+	SMTPTo            string    `gorm:"size:1024" json:"smtp_to"`
+	SMTPSecurity      string    `gorm:"size:32;not null;default:starttls" json:"smtp_security"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+type BackupNotification struct {
+	ID             string                  `gorm:"primaryKey;size:36" json:"id"`
+	BackupID       string                  `gorm:"size:36;not null;index:idx_backup_notification_unique,unique" json:"backup_id"`
+	NotificationID string                  `gorm:"size:36;not null;index:idx_backup_notification_unique,unique;index" json:"notification_id"`
+	OnSuccess      bool                    `gorm:"not null;default:true" json:"on_success"`
+	OnFailure      bool                    `gorm:"not null;default:true" json:"on_failure"`
+	Enabled        bool                    `gorm:"not null;default:true" json:"enabled"`
+	CreatedAt      time.Time               `json:"created_at"`
+	UpdatedAt      time.Time               `json:"updated_at"`
+	Backup         Backup                  `gorm:"foreignKey:BackupID" json:"backup,omitempty"`
+	Notification   NotificationDestination `gorm:"foreignKey:NotificationID" json:"notification,omitempty"`
+}

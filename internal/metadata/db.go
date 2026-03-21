@@ -23,5 +23,12 @@ func Open(cfg config.Config) (*gorm.DB, error) {
 }
 
 func Migrate(db *gorm.DB) error {
-	return db.AutoMigrate(&models.Connection{}, &models.Remote{}, &models.Backup{}, &models.BackupRun{})
+	return db.AutoMigrate(
+		&models.Connection{},
+		&models.Remote{},
+		&models.Backup{},
+		&models.BackupRun{},
+		&models.NotificationDestination{},
+		&models.BackupNotification{},
+	)
 }

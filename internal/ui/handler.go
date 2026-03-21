@@ -20,6 +20,7 @@ import (
 
 	"anchordb/internal/config"
 	"anchordb/internal/models"
+	"anchordb/internal/notifications"
 	"anchordb/internal/repository"
 	"anchordb/internal/scheduler"
 
@@ -38,31 +39,37 @@ var templateFS embed.FS
 type Handler struct {
 	repo      *repository.Repository
 	scheduler *scheduler.Scheduler
+	notifier  *notifications.Dispatcher
 	cfg       config.Config
 	tmpl      *template.Template
 }
 
 type pageData struct {
-	Connections      []models.Connection
-	Remotes          []models.Remote
-	Backups          []models.Backup
-	Runs             []models.BackupRun
-	RunItems         []runListItem
-	RunLog           []runLogLine
-	SelectedRunID    string
-	SelectedRun      runListItem
-	HasSelectedRun   bool
-	SelectedBackupID string
-	CurrentPage      string
-	Dashboard        dashboardStats
+	Connections              []models.Connection
+	Remotes                  []models.Remote
+	Backups                  []models.Backup
+	Notifications            []models.NotificationDestination
+	BackupBindings           []models.BackupNotification
+	Runs                     []models.BackupRun
+	RunItems                 []runListItem
+	RunLog                   []runLogLine
+	SelectedRunID            string
+	SelectedRun              runListItem
+	HasSelectedRun           bool
+	SelectedBackupID         string
+	BackupNotificationCounts map[string]int
+	CurrentPage              string
+	Dashboard                dashboardStats
 
-	ConnectionsMsg string
-	ConnectionsErr string
-	RemotesMsg     string
-	RemotesErr     string
-	BackupsMsg     string
-	BackupsErr     string
-	RunsErr        string
+	ConnectionsMsg   string
+	ConnectionsErr   string
+	RemotesMsg       string
+	RemotesErr       string
+	BackupsMsg       string
+	BackupsErr       string
+	NotificationsMsg string
+	NotificationsErr string
+	RunsErr          string
 }
 
 type dashboardStats struct {
@@ -125,9 +132,43 @@ func NewHandler(repo *repository.Repository, scheduler *scheduler.Scheduler, cfg
 				return "muted"
 			}
 		},
+		"notificationTypeLabel": func(kind string) string {
+			switch strings.ToLower(strings.TrimSpace(kind)) {
+			case "discord":
+				return "Discord"
+			case "smtp":
+				return "SMTP"
+			default:
+				return strings.ToUpper(strings.TrimSpace(kind))
+			}
+		},
+		"bindingEnabled": func(bindings []models.BackupNotification, notificationID string) bool {
+			for _, item := range bindings {
+				if item.NotificationID == notificationID && item.Enabled {
+					return true
+				}
+			}
+			return false
+		},
+		"bindingOnSuccess": func(bindings []models.BackupNotification, notificationID string) bool {
+			for _, item := range bindings {
+				if item.NotificationID == notificationID && item.Enabled {
+					return item.OnSuccess
+				}
+			}
+			return false
+		},
+		"bindingOnFailure": func(bindings []models.BackupNotification, notificationID string) bool {
+			for _, item := range bindings {
+				if item.NotificationID == notificationID && item.Enabled {
+					return item.OnFailure
+				}
+			}
+			return false
+		},
 	}).ParseFS(templateFS, "templates/*.html"))
 
-	return &Handler{repo: repo, scheduler: scheduler, cfg: cfg, tmpl: tmpl}
+	return &Handler{repo: repo, scheduler: scheduler, notifier: notifications.NewDispatcher(repo), cfg: cfg, tmpl: tmpl}
 }
 
 func (h *Handler) Router() http.Handler {
@@ -144,6 +185,12 @@ func (h *Handler) Router() http.Handler {
 	r.Get("/remotes", h.remotesPage)
 	r.Get("/remotes/section", h.remotesSection)
 	r.Post("/remotes", h.createRemote)
+	r.Get("/notifications", h.notificationsPage)
+	r.Get("/notifications/section", h.notificationsSection)
+	r.Post("/notifications", h.createNotification)
+	r.Post("/notifications/{id}/test", h.testNotification)
+	r.Post("/notifications/{id}/delete", h.deleteNotification)
+	r.Post("/notifications/bindings", h.saveNotificationBindings)
 	r.Get("/backups", h.backupsPage)
 	r.Get("/schedules", h.backupsPage)
 	r.Get("/backups/section", h.backupsSection)
@@ -212,6 +259,27 @@ func (h *Handler) remotesPage(w http.ResponseWriter, r *http.Request) {
 	}
 	redactRemotes(items)
 	h.render(w, "page", pageData{CurrentPage: "remotes", Remotes: items})
+}
+
+func (h *Handler) notificationsPage(w http.ResponseWriter, r *http.Request) {
+	selectedBackupID := strings.TrimSpace(r.URL.Query().Get("backup_id"))
+	data, err := h.loadNotificationsData(r.Context(), selectedBackupID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data.CurrentPage = "notifications"
+	h.render(w, "page", data)
+}
+
+func (h *Handler) notificationsSection(w http.ResponseWriter, r *http.Request) {
+	selectedBackupID := strings.TrimSpace(r.URL.Query().Get("backup_id"))
+	data, err := h.loadNotificationsData(r.Context(), selectedBackupID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	h.render(w, "notifications_section", data)
 }
 
 func (h *Handler) backupsSection(w http.ResponseWriter, r *http.Request) {
@@ -833,6 +901,135 @@ func (h *Handler) createRemote(w http.ResponseWriter, r *http.Request) {
 	h.renderRemotes(w, "Remote created", "")
 }
 
+func (h *Handler) createNotification(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		h.renderNotifications(w, "", "Invalid form data", strings.TrimSpace(r.FormValue("backup_id")))
+		return
+	}
+
+	selectedBackupID := strings.TrimSpace(r.FormValue("backup_id"))
+	notificationType := strings.ToLower(strings.TrimSpace(r.FormValue("type")))
+	enabled := r.FormValue("enabled") == "on" || r.FormValue("enabled") == "true"
+
+	item := models.NotificationDestination{
+		Name:              strings.TrimSpace(r.FormValue("name")),
+		Type:              notificationType,
+		Enabled:           enabled,
+		DiscordWebhookURL: strings.TrimSpace(r.FormValue("discord_webhook_url")),
+		SMTPHost:          strings.TrimSpace(r.FormValue("smtp_host")),
+		SMTPPort:          587,
+		SMTPUsername:      strings.TrimSpace(r.FormValue("smtp_username")),
+		SMTPPassword:      r.FormValue("smtp_password"),
+		SMTPFrom:          strings.TrimSpace(r.FormValue("smtp_from")),
+		SMTPTo:            strings.TrimSpace(r.FormValue("smtp_to")),
+		SMTPSecurity:      strings.ToLower(strings.TrimSpace(r.FormValue("smtp_security"))),
+	}
+
+	portRaw := strings.TrimSpace(r.FormValue("smtp_port"))
+	portMode := strings.TrimSpace(r.FormValue("smtp_port_mode"))
+	if portMode != "" && portMode != "other" {
+		portRaw = portMode
+	}
+	if portMode == "other" {
+		portRaw = strings.TrimSpace(r.FormValue("smtp_port_custom"))
+	}
+	if portRaw != "" {
+		port, err := strconv.Atoi(portRaw)
+		if err != nil || port <= 0 || port > 65535 {
+			h.renderNotifications(w, "", "smtp_port must be between 1 and 65535", selectedBackupID)
+			return
+		}
+		item.SMTPPort = port
+	}
+
+	if err := h.repo.CreateNotification(r.Context(), &item); err != nil {
+		h.renderNotifications(w, "", err.Error(), selectedBackupID)
+		return
+	}
+
+	h.renderNotifications(w, "Notification destination created", "", selectedBackupID)
+}
+
+func (h *Handler) testNotification(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	selectedBackupID := strings.TrimSpace(r.URL.Query().Get("backup_id"))
+
+	item, err := h.repo.GetNotification(r.Context(), id)
+	if err != nil {
+		h.renderNotifications(w, "", "notification not found", selectedBackupID)
+		return
+	}
+	if !item.Enabled {
+		h.renderNotifications(w, "", "notification is disabled", selectedBackupID)
+		return
+	}
+	if err := h.notifier.SendTestNotification(r.Context(), item); err != nil {
+		h.renderNotifications(w, "", "Test notification failed: "+err.Error(), selectedBackupID)
+		return
+	}
+
+	h.renderNotifications(w, "Test notification sent", "", selectedBackupID)
+}
+
+func (h *Handler) deleteNotification(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	selectedBackupID := strings.TrimSpace(r.URL.Query().Get("backup_id"))
+	if err := h.repo.DeleteNotification(r.Context(), id); err != nil {
+		h.renderNotifications(w, "", "notification not found", selectedBackupID)
+		return
+	}
+	h.renderNotifications(w, "Notification destination deleted", "", selectedBackupID)
+}
+
+func (h *Handler) saveNotificationBindings(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		h.renderNotifications(w, "", "Invalid form data", strings.TrimSpace(r.FormValue("backup_id")))
+		return
+	}
+
+	selectedBackupID := strings.TrimSpace(r.FormValue("backup_id"))
+	if selectedBackupID == "" {
+		h.renderNotifications(w, "", "backup_id is required", selectedBackupID)
+		return
+	}
+
+	notifications, err := h.repo.ListNotifications(r.Context())
+	if err != nil {
+		h.renderNotifications(w, "", err.Error(), selectedBackupID)
+		return
+	}
+
+	bindings := make([]models.BackupNotification, 0, len(notifications))
+	for _, notification := range notifications {
+		key := notification.ID
+		enabled := r.FormValue("binding_enabled_"+key) == "on"
+		if !enabled {
+			continue
+		}
+
+		onSuccess := r.FormValue("binding_success_"+key) == "on"
+		onFailure := r.FormValue("binding_failure_"+key) == "on"
+		if !onSuccess && !onFailure {
+			h.renderNotifications(w, "", "each enabled notification must have success or failure selected", selectedBackupID)
+			return
+		}
+
+		bindings = append(bindings, models.BackupNotification{
+			NotificationID: notification.ID,
+			Enabled:        true,
+			OnSuccess:      onSuccess,
+			OnFailure:      onFailure,
+		})
+	}
+
+	if _, err := h.repo.SetBackupNotifications(r.Context(), selectedBackupID, bindings); err != nil {
+		h.renderNotifications(w, "", err.Error(), selectedBackupID)
+		return
+	}
+
+	h.renderNotifications(w, "Schedule notifications updated", "", selectedBackupID)
+}
+
 func (h *Handler) createBackup(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		h.renderBackups(w, "", "Invalid form data")
@@ -992,6 +1189,14 @@ func (h *Handler) renderBackups(w http.ResponseWriter, msg, errMsg string) {
 	h.render(w, "backups_section", data)
 }
 
+func (h *Handler) renderNotifications(w http.ResponseWriter, msg, errMsg, selectedBackupID string) {
+	data, _ := h.loadNotificationsData(context.Background(), selectedBackupID)
+	data.CurrentPage = "notifications"
+	data.NotificationsMsg = msg
+	data.NotificationsErr = errMsg
+	h.render(w, "notifications_section", data)
+}
+
 func (h *Handler) render(w http.ResponseWriter, name string, data pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.tmpl.ExecuteTemplate(w, name, data); err != nil {
@@ -1026,7 +1231,78 @@ func (h *Handler) loadBackupsData(ctx context.Context) (pageData, error) {
 	if err != nil {
 		return pageData{}, err
 	}
-	return pageData{Connections: connections, Remotes: remotes, Backups: backups}, nil
+	counts := make(map[string]int, len(backups))
+	for _, backup := range backups {
+		bindings, bindErr := h.repo.ListBackupNotifications(ctx, backup.ID)
+		if bindErr != nil {
+			return pageData{}, bindErr
+		}
+		active := 0
+		for _, binding := range bindings {
+			if binding.Enabled {
+				active++
+			}
+		}
+		counts[backup.ID] = active
+	}
+
+	return pageData{
+		Connections:              connections,
+		Remotes:                  remotes,
+		Backups:                  backups,
+		BackupNotificationCounts: counts,
+	}, nil
+}
+
+func (h *Handler) loadNotificationsData(ctx context.Context, selectedBackupID string) (pageData, error) {
+	connections, remotes, backups, err := h.loadCoreData(ctx)
+	if err != nil {
+		return pageData{}, err
+	}
+
+	notifications, err := h.repo.ListNotifications(ctx)
+	if err != nil {
+		return pageData{}, err
+	}
+	redactNotifications(notifications)
+
+	counts := make(map[string]int, len(backups))
+	for _, backup := range backups {
+		bindings, bindErr := h.repo.ListBackupNotifications(ctx, backup.ID)
+		if bindErr != nil {
+			return pageData{}, bindErr
+		}
+		active := 0
+		for _, binding := range bindings {
+			if binding.Enabled {
+				active++
+			}
+		}
+		counts[backup.ID] = active
+	}
+
+	if strings.TrimSpace(selectedBackupID) == "" && len(backups) > 0 {
+		selectedBackupID = backups[0].ID
+	}
+
+	bindings := make([]models.BackupNotification, 0)
+	if strings.TrimSpace(selectedBackupID) != "" {
+		bindings, err = h.repo.ListBackupNotifications(ctx, selectedBackupID)
+		if err != nil {
+			return pageData{}, err
+		}
+		redactBackupNotifications(bindings)
+	}
+
+	return pageData{
+		Connections:              connections,
+		Remotes:                  remotes,
+		Backups:                  backups,
+		Notifications:            notifications,
+		BackupBindings:           bindings,
+		SelectedBackupID:         selectedBackupID,
+		BackupNotificationCounts: counts,
+	}, nil
 }
 
 func (h *Handler) loadDashboardData(ctx context.Context) (pageData, error) {
@@ -1171,6 +1447,20 @@ func redactBackups(items []models.Backup) {
 			items[i].Remote.AccessKey = ""
 			items[i].Remote.SecretKey = ""
 		}
+	}
+}
+
+func redactNotifications(items []models.NotificationDestination) {
+	for i := range items {
+		items[i].DiscordWebhookURL = ""
+		items[i].SMTPPassword = ""
+	}
+}
+
+func redactBackupNotifications(items []models.BackupNotification) {
+	for i := range items {
+		items[i].Notification.DiscordWebhookURL = ""
+		items[i].Notification.SMTPPassword = ""
 	}
 }
 

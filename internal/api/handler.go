@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"anchordb/internal/models"
+	"anchordb/internal/notifications"
 	"anchordb/internal/repository"
 	"anchordb/internal/scheduler"
 
@@ -21,10 +22,11 @@ import (
 type Handler struct {
 	repo      *repository.Repository
 	scheduler *scheduler.Scheduler
+	notifier  *notifications.Dispatcher
 }
 
 func NewHandler(repo *repository.Repository, scheduler *scheduler.Scheduler) *Handler {
-	return &Handler{repo: repo, scheduler: scheduler}
+	return &Handler{repo: repo, scheduler: scheduler, notifier: notifications.NewDispatcher(repo)}
 }
 
 func (h *Handler) Router() http.Handler {
@@ -50,6 +52,15 @@ func (h *Handler) Router() http.Handler {
 		r.Delete("/{id}", h.deleteRemote)
 	})
 
+	r.Route("/notifications", func(r chi.Router) {
+		r.Post("/", h.createNotification)
+		r.Get("/", h.listNotifications)
+		r.Get("/{id}", h.getNotification)
+		r.Patch("/{id}", h.updateNotification)
+		r.Post("/{id}/test", h.testNotification)
+		r.Delete("/{id}", h.deleteNotification)
+	})
+
 	r.Route("/backups", func(r chi.Router) {
 		r.Post("/", h.createBackup)
 		r.Get("/", h.listBackups)
@@ -59,6 +70,8 @@ func (h *Handler) Router() http.Handler {
 		r.Post("/{id}/run", h.runBackupNow)
 		r.Patch("/{id}/enabled", h.setBackupEnabled)
 		r.Get("/{id}/runs", h.listBackupRuns)
+		r.Get("/{id}/notifications", h.listBackupNotifications)
+		r.Put("/{id}/notifications", h.setBackupNotifications)
 	})
 
 	return r
@@ -249,6 +262,174 @@ func (h *Handler) deleteRemote(w http.ResponseWriter, r *http.Request) {
 	if err := h.repo.DeleteRemote(r.Context(), id); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			writeError(w, http.StatusNotFound, "remote not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (h *Handler) createNotification(w http.ResponseWriter, r *http.Request) {
+	type createRequest struct {
+		Name              string `json:"name"`
+		Type              string `json:"type"`
+		Enabled           *bool  `json:"enabled"`
+		DiscordWebhookURL string `json:"discord_webhook_url"`
+		SMTPHost          string `json:"smtp_host"`
+		SMTPPort          int    `json:"smtp_port"`
+		SMTPUsername      string `json:"smtp_username"`
+		SMTPPassword      string `json:"smtp_password"`
+		SMTPFrom          string `json:"smtp_from"`
+		SMTPTo            string `json:"smtp_to"`
+		SMTPSecurity      string `json:"smtp_security"`
+	}
+
+	var req createRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	item := models.NotificationDestination{
+		Name:              strings.TrimSpace(req.Name),
+		Type:              strings.ToLower(strings.TrimSpace(req.Type)),
+		Enabled:           enabled,
+		DiscordWebhookURL: strings.TrimSpace(req.DiscordWebhookURL),
+		SMTPHost:          strings.TrimSpace(req.SMTPHost),
+		SMTPPort:          req.SMTPPort,
+		SMTPUsername:      strings.TrimSpace(req.SMTPUsername),
+		SMTPPassword:      req.SMTPPassword,
+		SMTPFrom:          strings.TrimSpace(req.SMTPFrom),
+		SMTPTo:            strings.TrimSpace(req.SMTPTo),
+		SMTPSecurity:      strings.ToLower(strings.TrimSpace(req.SMTPSecurity)),
+	}
+
+	if err := h.repo.CreateNotification(r.Context(), &item); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	redactNotification(&item)
+	writeJSON(w, http.StatusCreated, item)
+}
+
+func (h *Handler) listNotifications(w http.ResponseWriter, r *http.Request) {
+	items, err := h.repo.ListNotifications(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	for i := range items {
+		redactNotification(&items[i])
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (h *Handler) getNotification(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	item, err := h.repo.GetNotification(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "notification not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	redactNotification(&item)
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (h *Handler) updateNotification(w http.ResponseWriter, r *http.Request) {
+	type patchRequest struct {
+		Name              *string `json:"name"`
+		Type              *string `json:"type"`
+		Enabled           *bool   `json:"enabled"`
+		DiscordWebhookURL *string `json:"discord_webhook_url"`
+		SMTPHost          *string `json:"smtp_host"`
+		SMTPPort          *int    `json:"smtp_port"`
+		SMTPUsername      *string `json:"smtp_username"`
+		SMTPPassword      *string `json:"smtp_password"`
+		SMTPFrom          *string `json:"smtp_from"`
+		SMTPTo            *string `json:"smtp_to"`
+		SMTPSecurity      *string `json:"smtp_security"`
+	}
+
+	id := chi.URLParam(r, "id")
+	var req patchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if req.Type != nil {
+		trimmed := strings.ToLower(strings.TrimSpace(*req.Type))
+		req.Type = &trimmed
+	}
+	if req.SMTPSecurity != nil {
+		trimmed := strings.ToLower(strings.TrimSpace(*req.SMTPSecurity))
+		req.SMTPSecurity = &trimmed
+	}
+
+	item, err := h.repo.UpdateNotification(r.Context(), id, repository.NotificationPatch{
+		Name:              req.Name,
+		Type:              req.Type,
+		Enabled:           req.Enabled,
+		DiscordWebhookURL: req.DiscordWebhookURL,
+		SMTPHost:          req.SMTPHost,
+		SMTPPort:          req.SMTPPort,
+		SMTPUsername:      req.SMTPUsername,
+		SMTPPassword:      req.SMTPPassword,
+		SMTPFrom:          req.SMTPFrom,
+		SMTPTo:            req.SMTPTo,
+		SMTPSecurity:      req.SMTPSecurity,
+	})
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "notification not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	redactNotification(&item)
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (h *Handler) testNotification(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	item, err := h.repo.GetNotification(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "notification not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if !item.Enabled {
+		writeError(w, http.StatusBadRequest, "notification is disabled")
+		return
+	}
+	if err := h.notifier.SendTestNotification(r.Context(), item); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+}
+
+func (h *Handler) deleteNotification(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if err := h.repo.DeleteNotification(r.Context(), id); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "notification not found")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -461,6 +642,93 @@ func (h *Handler) listBackupRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, items)
 }
 
+func (h *Handler) listBackupNotifications(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, err := h.repo.GetBackup(r.Context(), id); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "backup not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	items, err := h.repo.ListBackupNotifications(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	for i := range items {
+		redactNotification(&items[i].Notification)
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (h *Handler) setBackupNotifications(w http.ResponseWriter, r *http.Request) {
+	type notificationBindingRequest struct {
+		NotificationID string `json:"notification_id"`
+		OnSuccess      *bool  `json:"on_success"`
+		OnFailure      *bool  `json:"on_failure"`
+		Enabled        *bool  `json:"enabled"`
+	}
+	type bindingsRequest struct {
+		Notifications []notificationBindingRequest `json:"notifications"`
+	}
+
+	id := chi.URLParam(r, "id")
+	if _, err := h.repo.GetBackup(r.Context(), id); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "backup not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var req bindingsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+
+	bindings := make([]models.BackupNotification, 0, len(req.Notifications))
+	for _, item := range req.Notifications {
+		onSuccess := true
+		if item.OnSuccess != nil {
+			onSuccess = *item.OnSuccess
+		}
+		onFailure := true
+		if item.OnFailure != nil {
+			onFailure = *item.OnFailure
+		}
+		enabled := true
+		if item.Enabled != nil {
+			enabled = *item.Enabled
+		}
+
+		bindings = append(bindings, models.BackupNotification{
+			NotificationID: strings.TrimSpace(item.NotificationID),
+			OnSuccess:      onSuccess,
+			OnFailure:      onFailure,
+			Enabled:        enabled,
+		})
+	}
+
+	items, err := h.repo.SetBackupNotifications(r.Context(), id, bindings)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "backup not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	for i := range items {
+		redactNotification(&items[i].Notification)
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
 func (h *Handler) validateBackupRequest(r *http.Request, b models.Backup, create bool) error {
 	if create && (b.Name == "" || b.ConnectionID == "" || b.CronExpr == "" || b.TargetType == "") {
 		return errors.New("name, connection_id, cron_expr, target_type are required")
@@ -584,6 +852,11 @@ func redactConnection(c *models.Connection) {
 func redactRemote(r *models.Remote) {
 	r.AccessKey = ""
 	r.SecretKey = ""
+}
+
+func redactNotification(n *models.NotificationDestination) {
+	n.DiscordWebhookURL = ""
+	n.SMTPPassword = ""
 }
 
 func redactBackupSecrets(b *models.Backup) {

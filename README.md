@@ -11,7 +11,7 @@ AnchorDB is a lightweight Go service for automated database backups.
 - Supported databases: PostgreSQL, MySQL, Convex, and Cloudflare D1
 - Automated backup scheduling
 - API and web interface for connection and backup management
-- Notifications *(in progress)*
+- Notifications: Discord webhooks and SMTP destinations with per-schedule success/failure routing, test send, and SMTP security modes (STARTTLS, SSL/TLS, none)
 - Encryption and restore *(in progress)*
 - Open source (OSS)
 
