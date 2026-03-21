@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"anchordb/internal/api"
 	"anchordb/internal/models"
@@ -15,7 +16,7 @@ import (
 
 func TestHealthEndpoint(t *testing.T) {
 	stack := testutil.NewStack(t)
-	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
 	t.Cleanup(server.Close)
 
 	res, err := http.Get(server.URL + "/health")
@@ -43,7 +44,7 @@ func TestHealthEndpoint(t *testing.T) {
 
 func TestConnectionsEndpointsRedactSecrets(t *testing.T) {
 	stack := testutil.NewStack(t)
-	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
 	t.Cleanup(server.Close)
 
 	createdRes := doJSON(t, http.MethodPost, server.URL+"/connections", map[string]any{
@@ -99,9 +100,117 @@ func TestConnectionsEndpointsRedactSecrets(t *testing.T) {
 	}
 }
 
+func TestCreateConnectionUsesConfiguredHealthCheckDefaults(t *testing.T) {
+	stack := testutil.NewStack(t)
+	stack.Config.DefaultHealthEvery = 90 * time.Second
+	stack.Config.DefaultHealthTimeout = 7 * time.Second
+	stack.Config.DefaultFailThreshold = 4
+	stack.Config.DefaultPassThreshold = 2
+
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
+	t.Cleanup(server.Close)
+
+	createRes := doJSON(t, http.MethodPost, server.URL+"/connections", map[string]any{
+		"name":     "defaults-check",
+		"type":     "postgres",
+		"host":     "localhost",
+		"port":     5432,
+		"database": "appdb",
+		"username": "postgres",
+		"password": "secret",
+		"ssl_mode": "disable",
+	})
+	defer func() { _ = createRes.Body.Close() }()
+	if createRes.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createRes.StatusCode)
+	}
+
+	listRes := doJSON(t, http.MethodGet, server.URL+"/health-checks", nil)
+	defer func() { _ = listRes.Body.Close() }()
+	if listRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from list health checks, got %d", listRes.StatusCode)
+	}
+
+	var checks []models.HealthCheck
+	decodeJSON(t, listRes.Body, &checks)
+	if len(checks) != 1 {
+		t.Fatalf("expected 1 health check, got %d", len(checks))
+	}
+	if checks[0].CheckIntervalSecond != 90 {
+		t.Fatalf("expected interval 90, got %d", checks[0].CheckIntervalSecond)
+	}
+	if checks[0].TimeoutSecond != 7 {
+		t.Fatalf("expected timeout 7, got %d", checks[0].TimeoutSecond)
+	}
+	if checks[0].FailureThreshold != 4 {
+		t.Fatalf("expected failure threshold 4, got %d", checks[0].FailureThreshold)
+	}
+	if checks[0].SuccessThreshold != 2 {
+		t.Fatalf("expected success threshold 2, got %d", checks[0].SuccessThreshold)
+	}
+}
+
+func TestRunHealthCheckNowRespectsManualCooldown(t *testing.T) {
+	stack := testutil.NewStack(t)
+	stack.Config.DefaultHealthTimeout = 1 * time.Second
+	stack.Config.HealthManualCooldown = 1 * time.Minute
+
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
+	t.Cleanup(server.Close)
+
+	createRes := doJSON(t, http.MethodPost, server.URL+"/connections", map[string]any{
+		"name":     "cooldown-check",
+		"type":     "postgres",
+		"host":     "127.0.0.1",
+		"port":     1,
+		"database": "appdb",
+		"username": "postgres",
+		"password": "secret",
+		"ssl_mode": "disable",
+	})
+	defer func() { _ = createRes.Body.Close() }()
+	if createRes.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createRes.StatusCode)
+	}
+
+	checksRes := doJSON(t, http.MethodGet, server.URL+"/health-checks", nil)
+	defer func() { _ = checksRes.Body.Close() }()
+	if checksRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from list health checks, got %d", checksRes.StatusCode)
+	}
+
+	var checks []models.HealthCheck
+	decodeJSON(t, checksRes.Body, &checks)
+	if len(checks) != 1 {
+		t.Fatalf("expected 1 health check, got %d", len(checks))
+	}
+
+	firstRunRes := doJSON(t, http.MethodPost, server.URL+"/health-checks/"+checks[0].ID+"/run", nil)
+	defer func() { _ = firstRunRes.Body.Close() }()
+	if firstRunRes.StatusCode != http.StatusOK && firstRunRes.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 200 or 502 from first run, got %d", firstRunRes.StatusCode)
+	}
+
+	secondRunRes := doJSON(t, http.MethodPost, server.URL+"/health-checks/"+checks[0].ID+"/run", nil)
+	defer func() { _ = secondRunRes.Body.Close() }()
+	if secondRunRes.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 from second run due to cooldown, got %d", secondRunRes.StatusCode)
+	}
+
+	if secondRunRes.Header.Get("Retry-After") == "" {
+		t.Fatal("expected Retry-After header")
+	}
+
+	var body map[string]any
+	decodeJSON(t, secondRunRes.Body, &body)
+	if body["status"] != "cooldown" {
+		t.Fatalf("expected cooldown status, got %v", body["status"])
+	}
+}
+
 func TestBackupsCreateAndToggleIntegration(t *testing.T) {
 	stack := testutil.NewStack(t)
-	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
 	t.Cleanup(server.Close)
 
 	conn := testutil.MustCreateConnection(t, stack.Repo, "api-backup-source")
@@ -162,7 +271,7 @@ func TestBackupsCreateAndToggleIntegration(t *testing.T) {
 
 func TestCreateBackupValidationError(t *testing.T) {
 	stack := testutil.NewStack(t)
-	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
 	t.Cleanup(server.Close)
 
 	res := doJSON(t, http.MethodPost, server.URL+"/backups", map[string]any{
@@ -181,7 +290,7 @@ func TestCreateBackupValidationError(t *testing.T) {
 
 func TestCreateConvexConnectionWithMinimalFields(t *testing.T) {
 	stack := testutil.NewStack(t)
-	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
 	t.Cleanup(server.Close)
 
 	res := doJSON(t, http.MethodPost, server.URL+"/connections", map[string]any{
@@ -214,7 +323,7 @@ func TestCreateConvexConnectionWithMinimalFields(t *testing.T) {
 
 func TestCreateConvexBackupForcesNoCompression(t *testing.T) {
 	stack := testutil.NewStack(t)
-	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
 	t.Cleanup(server.Close)
 
 	connRes := doJSON(t, http.MethodPost, server.URL+"/connections", map[string]any{
@@ -260,7 +369,7 @@ func TestCreateConvexBackupForcesNoCompression(t *testing.T) {
 
 func TestCreateD1ConnectionWithMinimalFields(t *testing.T) {
 	stack := testutil.NewStack(t)
-	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
 	t.Cleanup(server.Close)
 
 	res := doJSON(t, http.MethodPost, server.URL+"/connections", map[string]any{
@@ -294,7 +403,7 @@ func TestCreateD1ConnectionWithMinimalFields(t *testing.T) {
 
 func TestNotificationsEndpointsAndBackupBindings(t *testing.T) {
 	stack := testutil.NewStack(t)
-	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	server := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
 	t.Cleanup(server.Close)
 
 	createNotificationRes := doJSON(t, http.MethodPost, server.URL+"/notifications", map[string]any{
@@ -350,7 +459,7 @@ func TestNotificationsEndpointsAndBackupBindings(t *testing.T) {
 
 func TestNotificationTestEndpointSendsDiscordWebhook(t *testing.T) {
 	stack := testutil.NewStack(t)
-	apiServer := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler).Router())
+	apiServer := httptest.NewServer(api.NewHandler(stack.Repo, stack.Scheduler, stack.Config).Router())
 	t.Cleanup(apiServer.Close)
 
 	called := false

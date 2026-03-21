@@ -1,17 +1,13 @@
 package ui
 
 import (
-	"bytes"
 	"context"
 	"embed"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
-	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,6 +15,7 @@ import (
 	"time"
 
 	"anchordb/internal/config"
+	"anchordb/internal/health"
 	"anchordb/internal/models"
 	"anchordb/internal/notifications"
 	"anchordb/internal/repository"
@@ -48,8 +45,11 @@ type pageData struct {
 	Connections              []models.Connection
 	Remotes                  []models.Remote
 	Backups                  []models.Backup
+	HealthChecks             []models.HealthCheck
+	DownHealthChecks         []models.HealthCheck
 	Notifications            []models.NotificationDestination
 	BackupBindings           []models.BackupNotification
+	HealthCheckBindings      []models.HealthCheckNotification
 	Runs                     []models.BackupRun
 	RunItems                 []runListItem
 	RunLog                   []runLogLine
@@ -57,7 +57,12 @@ type pageData struct {
 	SelectedRun              runListItem
 	HasSelectedRun           bool
 	SelectedBackupID         string
+	SelectedHealthCheckID    string
 	BackupNotificationCounts map[string]int
+	HealthNotificationCounts map[string]int
+	TotalHealthChecks        int
+	DownHealthCheckCount     int
+	HealthSummaryLabel       string
 	CurrentPage              string
 	Dashboard                dashboardStats
 
@@ -67,6 +72,8 @@ type pageData struct {
 	RemotesErr       string
 	BackupsMsg       string
 	BackupsErr       string
+	HealthChecksMsg  string
+	HealthChecksErr  string
 	NotificationsMsg string
 	NotificationsErr string
 	RunsErr          string
@@ -166,6 +173,30 @@ func NewHandler(repo *repository.Repository, scheduler *scheduler.Scheduler, cfg
 			}
 			return false
 		},
+		"healthBindingEnabled": func(bindings []models.HealthCheckNotification, notificationID string) bool {
+			for _, item := range bindings {
+				if item.NotificationID == notificationID && item.Enabled {
+					return true
+				}
+			}
+			return false
+		},
+		"healthBindingOnDown": func(bindings []models.HealthCheckNotification, notificationID string) bool {
+			for _, item := range bindings {
+				if item.NotificationID == notificationID && item.Enabled {
+					return item.OnDown
+				}
+			}
+			return false
+		},
+		"healthBindingOnRecovered": func(bindings []models.HealthCheckNotification, notificationID string) bool {
+			for _, item := range bindings {
+				if item.NotificationID == notificationID && item.Enabled {
+					return item.OnRecovered
+				}
+			}
+			return false
+		},
 	}).ParseFS(templateFS, "templates/*.html"))
 
 	return &Handler{repo: repo, scheduler: scheduler, notifier: notifications.NewDispatcher(repo), cfg: cfg, tmpl: tmpl}
@@ -191,6 +222,11 @@ func (h *Handler) Router() http.Handler {
 	r.Post("/notifications/{id}/test", h.testNotification)
 	r.Post("/notifications/{id}/delete", h.deleteNotification)
 	r.Post("/notifications/bindings", h.saveNotificationBindings)
+	r.Get("/health-checks", h.healthChecksPage)
+	r.Get("/health-checks/section", h.healthChecksSection)
+	r.Post("/health-checks/{id}/settings", h.updateHealthCheckSettings)
+	r.Post("/health-checks/{id}/run", h.runHealthCheckNow)
+	r.Post("/health-checks/bindings", h.saveHealthCheckBindings)
 	r.Get("/backups", h.backupsPage)
 	r.Get("/schedules", h.backupsPage)
 	r.Get("/backups/section", h.backupsSection)
@@ -218,7 +254,7 @@ func (h *Handler) dashboardPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data.CurrentPage = "dashboard"
-	h.render(w, "page", data)
+	h.renderPage(w, r, data)
 }
 
 func (h *Handler) connectionsPage(w http.ResponseWriter, r *http.Request) {
@@ -228,7 +264,7 @@ func (h *Handler) connectionsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	redactConnections(items)
-	h.render(w, "page", pageData{CurrentPage: "connections", Connections: items})
+	h.renderPage(w, r, pageData{CurrentPage: "connections", Connections: items})
 }
 
 func (h *Handler) connectionsSection(w http.ResponseWriter, r *http.Request) {
@@ -258,7 +294,7 @@ func (h *Handler) remotesPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	redactRemotes(items)
-	h.render(w, "page", pageData{CurrentPage: "remotes", Remotes: items})
+	h.renderPage(w, r, pageData{CurrentPage: "remotes", Remotes: items})
 }
 
 func (h *Handler) notificationsPage(w http.ResponseWriter, r *http.Request) {
@@ -269,7 +305,7 @@ func (h *Handler) notificationsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data.CurrentPage = "notifications"
-	h.render(w, "page", data)
+	h.renderPage(w, r, data)
 }
 
 func (h *Handler) notificationsSection(w http.ResponseWriter, r *http.Request) {
@@ -280,6 +316,27 @@ func (h *Handler) notificationsSection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.render(w, "notifications_section", data)
+}
+
+func (h *Handler) healthChecksPage(w http.ResponseWriter, r *http.Request) {
+	selectedHealthCheckID := strings.TrimSpace(r.URL.Query().Get("health_check_id"))
+	data, err := h.loadHealthChecksData(r.Context(), selectedHealthCheckID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data.CurrentPage = "health-checks"
+	h.renderPage(w, r, data)
+}
+
+func (h *Handler) healthChecksSection(w http.ResponseWriter, r *http.Request) {
+	selectedHealthCheckID := strings.TrimSpace(r.URL.Query().Get("health_check_id"))
+	data, err := h.loadHealthChecksData(r.Context(), selectedHealthCheckID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	h.render(w, "health_checks_section", data)
 }
 
 func (h *Handler) backupsSection(w http.ResponseWriter, r *http.Request) {
@@ -299,7 +356,7 @@ func (h *Handler) backupsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data.CurrentPage = "schedules"
-	h.render(w, "page", data)
+	h.renderPage(w, r, data)
 }
 
 func (h *Handler) backupRuns(w http.ResponseWriter, r *http.Request) {
@@ -314,7 +371,7 @@ func (h *Handler) runsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data.CurrentPage = "runs"
-	h.render(w, "page", data)
+	h.renderPage(w, r, data)
 }
 
 func (h *Handler) runsSection(w http.ResponseWriter, r *http.Request) {
@@ -613,6 +670,15 @@ func (h *Handler) createConnection(w http.ResponseWriter, r *http.Request) {
 		h.renderConnections(w, "", err.Error())
 		return
 	}
+	if _, err := h.repo.UpsertHealthCheckForConnection(r.Context(), item.ID, repository.HealthCheckDefaults{
+		IntervalSecond:   int(h.cfg.DefaultHealthEvery / time.Second),
+		TimeoutSecond:    int(h.cfg.DefaultHealthTimeout / time.Second),
+		FailureThreshold: h.cfg.DefaultFailThreshold,
+		SuccessThreshold: h.cfg.DefaultPassThreshold,
+	}); err != nil {
+		h.renderConnections(w, "", err.Error())
+		return
+	}
 
 	h.renderConnections(w, "Connection created", "")
 }
@@ -644,7 +710,6 @@ func (h *Handler) testConnection(w http.ResponseWriter, r *http.Request) {
 		h.renderConnections(w, "", "type and host are required for connection test")
 		return
 	}
-	applyConnectionDefaults(&item)
 
 	result, err := h.probeConnection(r.Context(), item)
 	if err != nil {
@@ -707,159 +772,8 @@ func (h *Handler) testAllConnections(w http.ResponseWriter, r *http.Request) {
 	h.renderConnections(w, fmt.Sprintf("%d/%d connections passed", passed, len(items)), strings.Join(failures, " | "))
 }
 
-func applyConnectionDefaults(item *models.Connection) {
-	if item.Port != 0 {
-		return
-	}
-
-	switch strings.ToLower(strings.TrimSpace(item.Type)) {
-	case "postgres", "postgresql":
-		item.Port = 5432
-	case "mysql":
-		item.Port = 3306
-	case "mssql":
-		item.Port = 1433
-	case "redis":
-		item.Port = 6379
-	case "mongo", "mongodb":
-		item.Port = 27017
-	}
-}
-
 func (h *Handler) probeConnection(ctx context.Context, item models.Connection) (string, error) {
-	typeName := strings.ToLower(strings.TrimSpace(item.Type))
-	host := strings.TrimSpace(item.Host)
-	if host == "" {
-		return "", errors.New("host is required")
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	switch typeName {
-	case "postgres", "postgresql", "mysql", "mssql", "redis", "mongo", "mongodb":
-		applyConnectionDefaults(&item)
-		if item.Port <= 0 {
-			return "", errors.New("port is required")
-		}
-		addr := host
-		if _, _, err := net.SplitHostPort(host); err != nil {
-			addr = net.JoinHostPort(host, strconv.Itoa(item.Port))
-		}
-		dialer := net.Dialer{Timeout: 4 * time.Second}
-		conn, err := dialer.DialContext(ctx, "tcp", addr)
-		if err != nil {
-			return "", err
-		}
-		_ = conn.Close()
-		return "TCP reachability OK (" + addr + ")", nil
-	case "convex":
-		raw := strings.TrimSpace(item.Host)
-		if !strings.Contains(raw, "://") {
-			raw = "https://" + raw
-		}
-		u, err := url.Parse(raw)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			return "", errors.New("invalid Convex URL")
-		}
-		port := u.Port()
-		if port == "" {
-			if strings.EqualFold(u.Scheme, "http") {
-				port = "80"
-			} else {
-				port = "443"
-			}
-		}
-		addr := net.JoinHostPort(u.Hostname(), port)
-		dialer := net.Dialer{Timeout: 4 * time.Second}
-		conn, err := dialer.DialContext(ctx, "tcp", addr)
-		if err != nil {
-			return "", err
-		}
-		_ = conn.Close()
-		return "Convex endpoint reachable (" + addr + ")", nil
-	case "d1":
-		accountID := strings.TrimSpace(item.Host)
-		if accountID == "" {
-			accountID = strings.TrimSpace(h.cfg.CloudflareAccountID)
-		}
-		databaseID := strings.TrimSpace(item.Database)
-		if databaseID == "" {
-			databaseID = strings.TrimSpace(h.cfg.CloudflareDatabaseID)
-		}
-		apiKey := strings.TrimSpace(item.Password)
-		if apiKey == "" {
-			apiKey = strings.TrimSpace(h.cfg.CloudflareAPIKey)
-		}
-		if accountID == "" || databaseID == "" || apiKey == "" {
-			return "", errors.New("d1 test requires account id, database id, and api key")
-		}
-		if err := h.testD1Query(ctx, accountID, databaseID, apiKey); err != nil {
-			return "", err
-		}
-		return "Cloudflare D1 API reachable", nil
-	default:
-		return "", fmt.Errorf("unsupported connection type: %s", item.Type)
-	}
-}
-
-func (h *Handler) testD1Query(ctx context.Context, accountID, databaseID, apiKey string) error {
-	endpoint := strings.TrimSuffix(strings.TrimSpace(h.cfg.D1APIBaseURL), "/")
-	if endpoint == "" {
-		endpoint = "https://api.cloudflare.com/client/v4"
-	}
-	endpoint = endpoint + "/accounts/" + url.PathEscape(accountID) + "/d1/database/" + url.PathEscape(databaseID) + "/query"
-
-	payload, err := json.Marshal(map[string]any{"sql": "SELECT 1 AS ok"})
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = res.Body.Close() }()
-
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}
-
-	var envelope struct {
-		Success bool `json:"success"`
-		Errors  []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		if res.StatusCode >= http.StatusBadRequest {
-			return fmt.Errorf("d1 query failed (status %d)", res.StatusCode)
-		}
-		return err
-	}
-
-	if res.StatusCode >= http.StatusBadRequest {
-		if len(envelope.Errors) > 0 && strings.TrimSpace(envelope.Errors[0].Message) != "" {
-			return errors.New(envelope.Errors[0].Message)
-		}
-		return fmt.Errorf("d1 query failed (status %d)", res.StatusCode)
-	}
-	if !envelope.Success {
-		if len(envelope.Errors) > 0 && strings.TrimSpace(envelope.Errors[0].Message) != "" {
-			return errors.New(envelope.Errors[0].Message)
-		}
-		return errors.New("d1 query returned unsuccessful response")
-	}
-
-	return nil
+	return health.ProbeConnection(ctx, item, h.cfg, 5*time.Second)
 }
 
 func (h *Handler) createRemote(w http.ResponseWriter, r *http.Request) {
@@ -1030,6 +944,171 @@ func (h *Handler) saveNotificationBindings(w http.ResponseWriter, r *http.Reques
 	h.renderNotifications(w, "Schedule notifications updated", "", selectedBackupID)
 }
 
+func (h *Handler) updateHealthCheckSettings(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		h.renderHealthChecks(w, "", "Invalid form data", strings.TrimSpace(r.FormValue("health_check_id")))
+		return
+	}
+
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	selectedHealthCheckID := strings.TrimSpace(r.FormValue("health_check_id"))
+	if selectedHealthCheckID == "" {
+		selectedHealthCheckID = id
+	}
+	if id == "" {
+		h.renderHealthChecks(w, "", "health check id is required", selectedHealthCheckID)
+		return
+	}
+
+	intervalSecond, err := strconv.Atoi(strings.TrimSpace(r.FormValue("check_interval_second")))
+	if err != nil || intervalSecond <= 0 {
+		h.renderHealthChecks(w, "", "check_interval_second must be a positive number", selectedHealthCheckID)
+		return
+	}
+	timeoutSecond, err := strconv.Atoi(strings.TrimSpace(r.FormValue("timeout_second")))
+	if err != nil || timeoutSecond <= 0 {
+		h.renderHealthChecks(w, "", "timeout_second must be a positive number", selectedHealthCheckID)
+		return
+	}
+	failureThreshold, err := strconv.Atoi(strings.TrimSpace(r.FormValue("failure_threshold")))
+	if err != nil || failureThreshold <= 0 {
+		h.renderHealthChecks(w, "", "failure_threshold must be a positive number", selectedHealthCheckID)
+		return
+	}
+	successThreshold, err := strconv.Atoi(strings.TrimSpace(r.FormValue("success_threshold")))
+	if err != nil || successThreshold <= 0 {
+		h.renderHealthChecks(w, "", "success_threshold must be a positive number", selectedHealthCheckID)
+		return
+	}
+
+	enabled := r.FormValue("enabled") == "on"
+	if _, err := h.repo.UpdateHealthCheck(r.Context(), id, repository.HealthCheckPatch{
+		Enabled:             &enabled,
+		CheckIntervalSecond: &intervalSecond,
+		TimeoutSecond:       &timeoutSecond,
+		FailureThreshold:    &failureThreshold,
+		SuccessThreshold:    &successThreshold,
+	}); err != nil {
+		h.renderHealthChecks(w, "", err.Error(), selectedHealthCheckID)
+		return
+	}
+
+	h.renderHealthChecks(w, "Health check settings updated", "", selectedHealthCheckID)
+}
+
+func (h *Handler) runHealthCheckNow(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	selectedHealthCheckID := strings.TrimSpace(r.URL.Query().Get("health_check_id"))
+	if selectedHealthCheckID == "" {
+		selectedHealthCheckID = id
+	}
+	if id == "" {
+		h.renderHealthChecks(w, "", "health check id is required", selectedHealthCheckID)
+		return
+	}
+
+	checkItem, err := h.repo.GetHealthCheck(r.Context(), id)
+	if err != nil {
+		h.renderHealthChecks(w, "", "health check not found", selectedHealthCheckID)
+		return
+	}
+	if checkItem.LastCheckedAt != nil && h.cfg.HealthManualCooldown > 0 {
+		nextAllowedAt := checkItem.LastCheckedAt.UTC().Add(h.cfg.HealthManualCooldown)
+		if time.Now().UTC().Before(nextAllowedAt) {
+			retryAfter := int(time.Until(nextAllowedAt).Seconds())
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			h.renderHealthChecks(w, "", "Manual health check is on cooldown. Retry in "+strconv.Itoa(retryAfter)+"s", selectedHealthCheckID)
+			return
+		}
+	}
+
+	timeoutSecond := checkItem.TimeoutSecond
+	if timeoutSecond <= 0 {
+		timeoutSecond = int(h.cfg.DefaultHealthTimeout / time.Second)
+	}
+	if timeoutSecond <= 0 {
+		timeoutSecond = 5
+	}
+	timeout := time.Duration(timeoutSecond) * time.Second
+
+	result, probeErr := health.ProbeConnection(r.Context(), checkItem.Connection, h.cfg, timeout)
+	healthy := probeErr == nil
+	errText := ""
+	if probeErr != nil {
+		errText = strings.TrimSpace(probeErr.Error())
+	}
+
+	updated, event, saveErr := h.repo.SaveHealthCheckProbeResult(r.Context(), checkItem.ID, time.Now().UTC(), healthy, errText)
+	if saveErr != nil {
+		h.renderHealthChecks(w, "", saveErr.Error(), selectedHealthCheckID)
+		return
+	}
+	if event != "" {
+		if notifyErr := h.notifier.NotifyHealthCheckEvent(r.Context(), updated, event); notifyErr != nil {
+			h.renderHealthChecks(w, "", "health check updated but notification failed: "+notifyErr.Error(), selectedHealthCheckID)
+			return
+		}
+		_ = h.repo.MarkHealthCheckNotified(r.Context(), updated.ID, time.Now().UTC())
+	}
+
+	if probeErr != nil {
+		h.renderHealthChecks(w, "", "Health check failed: "+probeErr.Error(), selectedHealthCheckID)
+		return
+	}
+	h.renderHealthChecks(w, "Health check passed: "+result, "", selectedHealthCheckID)
+}
+
+func (h *Handler) saveHealthCheckBindings(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		h.renderHealthChecks(w, "", "Invalid form data", strings.TrimSpace(r.FormValue("health_check_id")))
+		return
+	}
+
+	selectedHealthCheckID := strings.TrimSpace(r.FormValue("health_check_id"))
+	if selectedHealthCheckID == "" {
+		h.renderHealthChecks(w, "", "health_check_id is required", selectedHealthCheckID)
+		return
+	}
+
+	notifications, err := h.repo.ListNotifications(r.Context())
+	if err != nil {
+		h.renderHealthChecks(w, "", err.Error(), selectedHealthCheckID)
+		return
+	}
+
+	bindings := make([]models.HealthCheckNotification, 0, len(notifications))
+	for _, notification := range notifications {
+		key := notification.ID
+		enabled := r.FormValue("binding_enabled_"+key) == "on"
+		if !enabled {
+			continue
+		}
+
+		onDown := r.FormValue("binding_down_"+key) == "on"
+		onRecovered := r.FormValue("binding_recovered_"+key) == "on"
+		if !onDown && !onRecovered {
+			h.renderHealthChecks(w, "", "each enabled notification must have down or recovered selected", selectedHealthCheckID)
+			return
+		}
+
+		bindings = append(bindings, models.HealthCheckNotification{
+			NotificationID: notification.ID,
+			Enabled:        true,
+			OnDown:         onDown,
+			OnRecovered:    onRecovered,
+		})
+	}
+
+	if _, err := h.repo.SetHealthCheckNotifications(r.Context(), selectedHealthCheckID, bindings); err != nil {
+		h.renderHealthChecks(w, "", err.Error(), selectedHealthCheckID)
+		return
+	}
+
+	h.renderHealthChecks(w, "Health check notifications updated", "", selectedHealthCheckID)
+}
+
 func (h *Handler) createBackup(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		h.renderBackups(w, "", "Invalid form data")
@@ -1197,11 +1276,27 @@ func (h *Handler) renderNotifications(w http.ResponseWriter, msg, errMsg, select
 	h.render(w, "notifications_section", data)
 }
 
+func (h *Handler) renderHealthChecks(w http.ResponseWriter, msg, errMsg, selectedHealthCheckID string) {
+	data, _ := h.loadHealthChecksData(context.Background(), selectedHealthCheckID)
+	data.CurrentPage = "health-checks"
+	data.HealthChecksMsg = msg
+	data.HealthChecksErr = errMsg
+	h.render(w, "health_checks_section", data)
+}
+
 func (h *Handler) render(w http.ResponseWriter, name string, data pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.tmpl.ExecuteTemplate(w, name, data); err != nil {
 		http.Error(w, "template rendering failed", http.StatusInternalServerError)
 	}
+}
+
+func (h *Handler) renderPage(w http.ResponseWriter, r *http.Request, data pageData) {
+	if err := h.decorateHeaderHealth(r.Context(), &data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	h.render(w, "page", data)
 }
 
 func (h *Handler) loadCoreData(ctx context.Context) ([]models.Connection, []models.Remote, []models.Backup, error) {
@@ -1254,6 +1349,35 @@ func (h *Handler) loadBackupsData(ctx context.Context) (pageData, error) {
 	}, nil
 }
 
+func (h *Handler) decorateHeaderHealth(ctx context.Context, data *pageData) error {
+	checks, err := h.repo.ListHealthChecks(ctx)
+	if err != nil {
+		return err
+	}
+	redactHealthChecks(checks)
+
+	down := make([]models.HealthCheck, 0)
+	for _, item := range checks {
+		if strings.EqualFold(strings.TrimSpace(item.Status), "down") {
+			down = append(down, item)
+		}
+	}
+
+	data.TotalHealthChecks = len(checks)
+	data.DownHealthChecks = down
+	data.DownHealthCheckCount = len(down)
+	if len(checks) == 0 {
+		data.HealthSummaryLabel = "No health checks configured"
+		return nil
+	}
+	if len(down) > 0 {
+		data.HealthSummaryLabel = fmt.Sprintf("%d database(s) down", len(down))
+		return nil
+	}
+	data.HealthSummaryLabel = "All systems operational"
+	return nil
+}
+
 func (h *Handler) loadNotificationsData(ctx context.Context, selectedBackupID string) (pageData, error) {
 	connections, remotes, backups, err := h.loadCoreData(ctx)
 	if err != nil {
@@ -1302,6 +1426,64 @@ func (h *Handler) loadNotificationsData(ctx context.Context, selectedBackupID st
 		BackupBindings:           bindings,
 		SelectedBackupID:         selectedBackupID,
 		BackupNotificationCounts: counts,
+	}, nil
+}
+
+func (h *Handler) loadHealthChecksData(ctx context.Context, selectedHealthCheckID string) (pageData, error) {
+	connections, remotes, backups, err := h.loadCoreData(ctx)
+	if err != nil {
+		return pageData{}, err
+	}
+
+	healthChecks, err := h.repo.ListHealthChecks(ctx)
+	if err != nil {
+		return pageData{}, err
+	}
+	redactHealthChecks(healthChecks)
+
+	notifications, err := h.repo.ListNotifications(ctx)
+	if err != nil {
+		return pageData{}, err
+	}
+	redactNotifications(notifications)
+
+	counts := make(map[string]int, len(healthChecks))
+	for _, check := range healthChecks {
+		bindings, bindErr := h.repo.ListHealthCheckNotifications(ctx, check.ID)
+		if bindErr != nil {
+			return pageData{}, bindErr
+		}
+		active := 0
+		for _, binding := range bindings {
+			if binding.Enabled {
+				active++
+			}
+		}
+		counts[check.ID] = active
+	}
+
+	if strings.TrimSpace(selectedHealthCheckID) == "" && len(healthChecks) > 0 {
+		selectedHealthCheckID = healthChecks[0].ID
+	}
+
+	bindings := make([]models.HealthCheckNotification, 0)
+	if strings.TrimSpace(selectedHealthCheckID) != "" {
+		bindings, err = h.repo.ListHealthCheckNotifications(ctx, selectedHealthCheckID)
+		if err != nil {
+			return pageData{}, err
+		}
+		redactHealthCheckNotifications(bindings)
+	}
+
+	return pageData{
+		Connections:              connections,
+		Remotes:                  remotes,
+		Backups:                  backups,
+		HealthChecks:             healthChecks,
+		Notifications:            notifications,
+		HealthCheckBindings:      bindings,
+		SelectedHealthCheckID:    selectedHealthCheckID,
+		HealthNotificationCounts: counts,
 	}, nil
 }
 
@@ -1458,6 +1640,19 @@ func redactNotifications(items []models.NotificationDestination) {
 }
 
 func redactBackupNotifications(items []models.BackupNotification) {
+	for i := range items {
+		items[i].Notification.DiscordWebhookURL = ""
+		items[i].Notification.SMTPPassword = ""
+	}
+}
+
+func redactHealthChecks(items []models.HealthCheck) {
+	for i := range items {
+		items[i].Connection.Password = ""
+	}
+}
+
+func redactHealthCheckNotifications(items []models.HealthCheckNotification) {
 	for i := range items {
 		items[i].Notification.DiscordWebhookURL = ""
 		items[i].Notification.SMTPPassword = ""

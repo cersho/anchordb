@@ -72,6 +72,49 @@ func (d *Dispatcher) NotifyBackupRun(ctx context.Context, backup models.Backup, 
 	return nil
 }
 
+func (d *Dispatcher) NotifyHealthCheckEvent(ctx context.Context, check models.HealthCheck, event string) error {
+	eventName := strings.ToLower(strings.TrimSpace(event))
+	if eventName != "down" && eventName != "recovered" {
+		return nil
+	}
+
+	destinations, err := d.repo.ListHealthNotificationDestinationsForEvent(ctx, check.ID, eventName)
+	if err != nil {
+		return err
+	}
+	if len(destinations) == 0 {
+		return nil
+	}
+
+	subject := buildHealthSMTPSubject(check, eventName)
+	body := formatHealthMessage(check, eventName)
+	errs := make([]string, 0)
+	for _, destination := range destinations {
+		if strings.TrimSpace(destination.Type) == "" {
+			continue
+		}
+
+		var sendErr error
+		switch strings.ToLower(strings.TrimSpace(destination.Type)) {
+		case "discord":
+			sendErr = d.sendDiscordMessage(ctx, destination, body)
+		case "smtp":
+			sendErr = d.sendSMTPMessage(ctx, destination, subject, body)
+		default:
+			sendErr = fmt.Errorf("unsupported notification type: %s", destination.Type)
+		}
+
+		if sendErr != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", destination.Name, sendErr))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
 func (d *Dispatcher) SendTestNotification(ctx context.Context, destination models.NotificationDestination) error {
 	kind := strings.ToLower(strings.TrimSpace(destination.Type))
 	message := "AnchorDB test notification\n- Result: Delivery channel is configured correctly"
@@ -242,6 +285,53 @@ func buildSMTPSubject(backup models.Backup, run models.BackupRun) string {
 		status = "UNKNOWN"
 	}
 	return fmt.Sprintf("[AnchorDB] %s - %s", status, backup.Name)
+}
+
+func buildHealthSMTPSubject(check models.HealthCheck, event string) string {
+	state := "DOWN"
+	if event == "recovered" {
+		state = "RECOVERED"
+	}
+	connectionName := strings.TrimSpace(check.Connection.Name)
+	if connectionName == "" {
+		connectionName = check.ConnectionID
+	}
+	return fmt.Sprintf("[AnchorDB] HEALTH %s - %s", state, connectionName)
+}
+
+func formatHealthMessage(check models.HealthCheck, event string) string {
+	state := "DOWN"
+	if event == "recovered" {
+		state = "RECOVERED"
+	}
+	b := strings.Builder{}
+	b.WriteString("AnchorDB health check ")
+	b.WriteString(state)
+	b.WriteString("\n")
+	b.WriteString("- Connection: ")
+	b.WriteString(check.Connection.Name)
+	b.WriteString("\n")
+	b.WriteString("- Type: ")
+	b.WriteString(check.Connection.Type)
+	b.WriteString("\n")
+	b.WriteString("- Host: ")
+	b.WriteString(check.Connection.Host)
+	b.WriteString("\n")
+	b.WriteString("- Status: ")
+	b.WriteString(strings.ToUpper(strings.TrimSpace(check.Status)))
+	if check.LastCheckedAt != nil {
+		b.WriteString("\n- Checked: ")
+		b.WriteString(check.LastCheckedAt.UTC().Format(time.RFC3339))
+	}
+	if check.ConsecutiveFailures > 0 {
+		b.WriteString("\n- Consecutive failures: ")
+		b.WriteString(strconv.Itoa(check.ConsecutiveFailures))
+	}
+	if strings.TrimSpace(check.LastError) != "" {
+		b.WriteString("\n- Error: ")
+		b.WriteString(strings.TrimSpace(check.LastError))
+	}
+	return b.String()
 }
 
 func buildSMTPMessage(from string, to []string, subject, body string) string {

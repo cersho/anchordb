@@ -33,6 +33,21 @@ type NotificationPatch struct {
 	SMTPSecurity      *string
 }
 
+type HealthCheckDefaults struct {
+	IntervalSecond   int
+	TimeoutSecond    int
+	FailureThreshold int
+	SuccessThreshold int
+}
+
+type HealthCheckPatch struct {
+	Enabled             *bool
+	CheckIntervalSecond *int
+	TimeoutSecond       *int
+	FailureThreshold    *int
+	SuccessThreshold    *int
+}
+
 func New(db *gorm.DB, cryptoSvc *crypto.Service) *Repository {
 	return &Repository{db: db, crypto: cryptoSvc}
 }
@@ -103,14 +118,29 @@ func (r *Repository) UpdateConnection(ctx context.Context, id string, c *models.
 }
 
 func (r *Repository) DeleteConnection(ctx context.Context, id string) error {
-	res := r.db.WithContext(ctx).Delete(&models.Connection{}, "id = ?", id)
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var checkIDs []string
+		if err := tx.Model(&models.HealthCheck{}).Where("connection_id = ?", id).Pluck("id", &checkIDs).Error; err != nil {
+			return err
+		}
+		if len(checkIDs) > 0 {
+			if err := tx.Where("health_check_id IN ?", checkIDs).Delete(&models.HealthCheckNotification{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("connection_id = ?", id).Delete(&models.HealthCheck{}).Error; err != nil {
+			return err
+		}
+
+		res := tx.Delete(&models.Connection{}, "id = ?", id)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return nil
+	})
 }
 
 func (r *Repository) ListConnections(ctx context.Context) ([]models.Connection, error) {
@@ -280,6 +310,9 @@ func (r *Repository) CreateNotification(ctx context.Context, n *models.Notificat
 	if err := r.db.WithContext(ctx).Create(&copy).Error; err != nil {
 		return err
 	}
+	if err := r.attachNotificationToAllHealthChecks(ctx, copy.ID); err != nil {
+		return err
+	}
 	*n = copy
 	return r.decryptNotification(n)
 }
@@ -351,6 +384,9 @@ func (r *Repository) UpdateNotification(ctx context.Context, id string, patch No
 func (r *Repository) DeleteNotification(ctx context.Context, id string) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Delete(&models.BackupNotification{}, "notification_id = ?", id).Error; err != nil {
+			return err
+		}
+		if err := tx.Delete(&models.HealthCheckNotification{}, "notification_id = ?", id).Error; err != nil {
 			return err
 		}
 		res := tx.Delete(&models.NotificationDestination{}, "id = ?", id)
@@ -502,6 +538,405 @@ func (r *Repository) ListNotificationDestinationsForEvent(ctx context.Context, b
 		items = append(items, binding.Notification)
 	}
 	return items, nil
+}
+
+func (r *Repository) EnsureHealthChecksForConnections(ctx context.Context, defaults HealthCheckDefaults) error {
+	conns, err := r.ListConnections(ctx)
+	if err != nil {
+		return err
+	}
+	for _, conn := range conns {
+		if _, err := r.UpsertHealthCheckForConnection(ctx, conn.ID, defaults); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Repository) UpsertHealthCheckForConnection(ctx context.Context, connectionID string, defaults HealthCheckDefaults) (models.HealthCheck, error) {
+	var item models.HealthCheck
+	err := r.db.WithContext(ctx).Where("connection_id = ?", strings.TrimSpace(connectionID)).First(&item).Error
+	if err == nil {
+		if seedErr := r.seedDefaultHealthCheckNotifications(ctx, item.ID); seedErr != nil {
+			return models.HealthCheck{}, seedErr
+		}
+		return r.GetHealthCheck(ctx, item.ID)
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return models.HealthCheck{}, err
+	}
+
+	now := time.Now().UTC()
+	item = models.HealthCheck{
+		ID:                  uuid.NewString(),
+		ConnectionID:        strings.TrimSpace(connectionID),
+		Enabled:             true,
+		CheckIntervalSecond: normalizePositive(defaults.IntervalSecond, 60),
+		TimeoutSecond:       normalizePositive(defaults.TimeoutSecond, 5),
+		FailureThreshold:    normalizePositive(defaults.FailureThreshold, 3),
+		SuccessThreshold:    normalizePositive(defaults.SuccessThreshold, 1),
+		Status:              "unknown",
+		NextCheckAt:         &now,
+	}
+	if err := r.db.WithContext(ctx).Create(&item).Error; err != nil {
+		return models.HealthCheck{}, err
+	}
+	if err := r.seedDefaultHealthCheckNotifications(ctx, item.ID); err != nil {
+		return models.HealthCheck{}, err
+	}
+	return r.GetHealthCheck(ctx, item.ID)
+}
+
+func (r *Repository) ListHealthChecks(ctx context.Context) ([]models.HealthCheck, error) {
+	var items []models.HealthCheck
+	err := r.db.WithContext(ctx).
+		Preload("Connection").
+		Order("created_at desc").
+		Find(&items).Error
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if decErr := r.decryptConnection(&items[i].Connection); decErr != nil {
+			return nil, decErr
+		}
+	}
+	return items, nil
+}
+
+func (r *Repository) GetHealthCheck(ctx context.Context, id string) (models.HealthCheck, error) {
+	var item models.HealthCheck
+	err := r.db.WithContext(ctx).
+		Preload("Connection").
+		First(&item, "id = ?", id).Error
+	if err != nil {
+		return models.HealthCheck{}, err
+	}
+	if err := r.decryptConnection(&item.Connection); err != nil {
+		return models.HealthCheck{}, err
+	}
+	return item, nil
+}
+
+func (r *Repository) UpdateHealthCheck(ctx context.Context, id string, patch HealthCheckPatch) (models.HealthCheck, error) {
+	var item models.HealthCheck
+	if err := r.db.WithContext(ctx).First(&item, "id = ?", id).Error; err != nil {
+		return models.HealthCheck{}, err
+	}
+
+	if patch.Enabled != nil {
+		item.Enabled = *patch.Enabled
+	}
+	if patch.CheckIntervalSecond != nil {
+		item.CheckIntervalSecond = normalizePositive(*patch.CheckIntervalSecond, item.CheckIntervalSecond)
+	}
+	if patch.TimeoutSecond != nil {
+		item.TimeoutSecond = normalizePositive(*patch.TimeoutSecond, item.TimeoutSecond)
+	}
+	if patch.FailureThreshold != nil {
+		item.FailureThreshold = normalizePositive(*patch.FailureThreshold, item.FailureThreshold)
+	}
+	if patch.SuccessThreshold != nil {
+		item.SuccessThreshold = normalizePositive(*patch.SuccessThreshold, item.SuccessThreshold)
+	}
+	if item.CheckIntervalSecond <= 0 {
+		item.CheckIntervalSecond = 60
+	}
+	if item.TimeoutSecond <= 0 {
+		item.TimeoutSecond = 5
+	}
+	if item.FailureThreshold <= 0 {
+		item.FailureThreshold = 3
+	}
+	if item.SuccessThreshold <= 0 {
+		item.SuccessThreshold = 1
+	}
+	if err := r.db.WithContext(ctx).Save(&item).Error; err != nil {
+		return models.HealthCheck{}, err
+	}
+	return r.GetHealthCheck(ctx, item.ID)
+}
+
+func (r *Repository) ListDueHealthChecks(ctx context.Context, now time.Time, limit int) ([]models.HealthCheck, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var items []models.HealthCheck
+	err := r.db.WithContext(ctx).
+		Where("enabled = ?", true).
+		Where("next_check_at IS NULL OR next_check_at <= ?", now.UTC()).
+		Preload("Connection").
+		Order("next_check_at asc").
+		Limit(limit).
+		Find(&items).Error
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if decErr := r.decryptConnection(&items[i].Connection); decErr != nil {
+			return nil, decErr
+		}
+	}
+	return items, nil
+}
+
+func (r *Repository) ClaimHealthCheckRun(ctx context.Context, id string, now time.Time, lease time.Duration) (bool, error) {
+	if lease <= 0 {
+		lease = 10 * time.Second
+	}
+	nowUTC := now.UTC()
+	next := nowUTC.Add(lease)
+
+	res := r.db.WithContext(ctx).
+		Model(&models.HealthCheck{}).
+		Where("id = ?", id).
+		Where("enabled = ?", true).
+		Where("next_check_at IS NULL OR next_check_at <= ?", nowUTC).
+		Updates(map[string]any{"next_check_at": &next})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
+}
+
+func (r *Repository) SaveHealthCheckProbeResult(ctx context.Context, id string, checkedAt time.Time, healthy bool, errorText string) (models.HealthCheck, string, error) {
+	var item models.HealthCheck
+	if err := r.db.WithContext(ctx).First(&item, "id = ?", id).Error; err != nil {
+		return models.HealthCheck{}, "", err
+	}
+
+	oldStatus := strings.ToLower(strings.TrimSpace(item.Status))
+	if oldStatus == "" {
+		oldStatus = "unknown"
+	}
+
+	if healthy {
+		item.ConsecutiveSuccess++
+		item.ConsecutiveFailures = 0
+		item.LastError = ""
+		if item.ConsecutiveSuccess >= normalizePositive(item.SuccessThreshold, 1) {
+			item.Status = "up"
+		}
+	} else {
+		item.ConsecutiveFailures++
+		item.ConsecutiveSuccess = 0
+		item.LastError = strings.TrimSpace(errorText)
+		if item.ConsecutiveFailures >= normalizePositive(item.FailureThreshold, 3) {
+			item.Status = "down"
+		}
+	}
+
+	if strings.TrimSpace(item.Status) == "" {
+		item.Status = "unknown"
+	}
+
+	checked := checkedAt.UTC()
+	item.LastCheckedAt = &checked
+	next := checked.Add(time.Duration(normalizePositive(item.CheckIntervalSecond, 60)) * time.Second)
+	item.NextCheckAt = &next
+
+	if err := r.db.WithContext(ctx).Save(&item).Error; err != nil {
+		return models.HealthCheck{}, "", err
+	}
+
+	newStatus := strings.ToLower(strings.TrimSpace(item.Status))
+	event := ""
+	if oldStatus != "down" && newStatus == "down" {
+		event = "down"
+	}
+	if oldStatus == "down" && newStatus == "up" {
+		event = "recovered"
+	}
+
+	fresh, err := r.GetHealthCheck(ctx, item.ID)
+	if err != nil {
+		return models.HealthCheck{}, "", err
+	}
+	return fresh, event, nil
+}
+
+func (r *Repository) MarkHealthCheckNotified(ctx context.Context, id string, at time.Time) error {
+	t := at.UTC()
+	return r.db.WithContext(ctx).
+		Model(&models.HealthCheck{}).
+		Where("id = ?", id).
+		Update("last_notified_at", &t).Error
+}
+
+func (r *Repository) ListHealthCheckNotifications(ctx context.Context, healthCheckID string) ([]models.HealthCheckNotification, error) {
+	var items []models.HealthCheckNotification
+	err := r.db.WithContext(ctx).
+		Where("health_check_id = ?", healthCheckID).
+		Preload("Notification").
+		Order("created_at asc").
+		Find(&items).Error
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if items[i].Notification.ID != "" {
+			if decErr := r.decryptNotification(&items[i].Notification); decErr != nil {
+				return nil, decErr
+			}
+		}
+	}
+	return items, nil
+}
+
+func (r *Repository) SetHealthCheckNotifications(ctx context.Context, healthCheckID string, bindings []models.HealthCheckNotification) ([]models.HealthCheckNotification, error) {
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var check models.HealthCheck
+		if err := tx.First(&check, "id = ?", healthCheckID).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Delete(&models.HealthCheckNotification{}, "health_check_id = ?", healthCheckID).Error; err != nil {
+			return err
+		}
+
+		seen := make(map[string]struct{}, len(bindings))
+		for _, binding := range bindings {
+			notificationID := strings.TrimSpace(binding.NotificationID)
+			if notificationID == "" {
+				return errors.New("notification_id is required")
+			}
+			if _, ok := seen[notificationID]; ok {
+				return fmt.Errorf("duplicate notification_id: %s", notificationID)
+			}
+			seen[notificationID] = struct{}{}
+			if !binding.OnDown && !binding.OnRecovered {
+				return fmt.Errorf("notification %s must enable on_down or on_recovered", notificationID)
+			}
+
+			var destination models.NotificationDestination
+			if err := tx.First(&destination, "id = ?", notificationID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("notification_id not found: %s", notificationID)
+				}
+				return err
+			}
+
+			now := time.Now().UTC()
+			item := map[string]any{
+				"id":              uuid.NewString(),
+				"health_check_id": healthCheckID,
+				"notification_id": notificationID,
+				"on_down":         binding.OnDown,
+				"on_recovered":    binding.OnRecovered,
+				"enabled":         binding.Enabled,
+				"created_at":      now,
+				"updated_at":      now,
+			}
+			if err := tx.Table("health_check_notifications").Create(item).Error; err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return r.ListHealthCheckNotifications(ctx, healthCheckID)
+}
+
+func (r *Repository) ListHealthNotificationDestinationsForEvent(ctx context.Context, healthCheckID, event string) ([]models.NotificationDestination, error) {
+	column := "on_down"
+	if strings.EqualFold(strings.TrimSpace(event), "recovered") {
+		column = "on_recovered"
+	}
+
+	var bindings []models.HealthCheckNotification
+	err := r.db.WithContext(ctx).
+		Where("health_check_id = ?", healthCheckID).
+		Where("enabled = ?", true).
+		Where(column+" = ?", true).
+		Preload("Notification", "enabled = ?", true).
+		Find(&bindings).Error
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]models.NotificationDestination, 0, len(bindings))
+	for _, binding := range bindings {
+		if binding.Notification.ID == "" {
+			continue
+		}
+		if decErr := r.decryptNotification(&binding.Notification); decErr != nil {
+			return nil, decErr
+		}
+		items = append(items, binding.Notification)
+	}
+	return items, nil
+}
+
+func normalizePositive(value, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	if fallback > 0 {
+		return fallback
+	}
+	return 1
+}
+
+func (r *Repository) seedDefaultHealthCheckNotifications(ctx context.Context, healthCheckID string) error {
+	var count int64
+	if err := r.db.WithContext(ctx).Model(&models.HealthCheckNotification{}).Where("health_check_id = ?", healthCheckID).Count(&count).Error; err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+
+	var destinations []models.NotificationDestination
+	if err := r.db.WithContext(ctx).Where("enabled = ?", true).Find(&destinations).Error; err != nil {
+		return err
+	}
+	if len(destinations) == 0 {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	items := make([]map[string]any, 0, len(destinations))
+	for _, destination := range destinations {
+		items = append(items, map[string]any{
+			"id":              uuid.NewString(),
+			"health_check_id": healthCheckID,
+			"notification_id": destination.ID,
+			"on_down":         true,
+			"on_recovered":    true,
+			"enabled":         true,
+			"created_at":      now,
+			"updated_at":      now,
+		})
+	}
+	return r.db.WithContext(ctx).Table("health_check_notifications").Create(items).Error
+}
+
+func (r *Repository) attachNotificationToAllHealthChecks(ctx context.Context, notificationID string) error {
+	var checks []models.HealthCheck
+	if err := r.db.WithContext(ctx).Select("id").Find(&checks).Error; err != nil {
+		return err
+	}
+	if len(checks) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	items := make([]map[string]any, 0, len(checks))
+	for _, check := range checks {
+		items = append(items, map[string]any{
+			"id":              uuid.NewString(),
+			"health_check_id": check.ID,
+			"notification_id": notificationID,
+			"on_down":         true,
+			"on_recovered":    true,
+			"enabled":         true,
+			"created_at":      now,
+			"updated_at":      now,
+		})
+	}
+	return r.db.WithContext(ctx).Table("health_check_notifications").Create(items).Error
 }
 
 func validateNotificationDestination(n models.NotificationDestination) error {

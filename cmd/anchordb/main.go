@@ -12,6 +12,7 @@ import (
 	"anchordb/internal/api"
 	"anchordb/internal/config"
 	"anchordb/internal/crypto"
+	"anchordb/internal/health"
 	"anchordb/internal/metadata"
 	"anchordb/internal/repository"
 	"anchordb/internal/scheduler"
@@ -36,14 +37,16 @@ func main() {
 	repo := repository.New(db, cryptoSvc)
 	exec := scheduler.NewExecutor(cfg)
 	sch := scheduler.New(repo, exec, cfg)
+	hmon := health.NewMonitor(cfg, repo)
 
 	ctx := context.Background()
 	if err := sch.LoadAll(ctx); err != nil {
 		log.Fatalf("load schedules: %v", err)
 	}
 	sch.Start()
+	hmon.Start(ctx)
 
-	apiHandler := api.NewHandler(repo, sch)
+	apiHandler := api.NewHandler(repo, sch, cfg)
 	uiHandler := ui.NewHandler(repo, sch, cfg)
 
 	r := chi.NewRouter()
@@ -71,6 +74,7 @@ func main() {
 
 	log.Println("shutting down")
 	sch.Stop()
+	hmon.Stop()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
