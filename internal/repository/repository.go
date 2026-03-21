@@ -289,6 +289,9 @@ func (r *Repository) UpdateNotification(ctx context.Context, id string, patch No
 	if err != nil {
 		return models.NotificationDestination{}, err
 	}
+	if err := r.decryptNotification(&existing); err != nil {
+		return models.NotificationDestination{}, err
+	}
 
 	if patch.Name != nil {
 		existing.Name = strings.TrimSpace(*patch.Name)
@@ -445,6 +448,7 @@ func (r *Repository) SetBackupNotifications(ctx context.Context, backupID string
 				return err
 			}
 
+			now := time.Now().UTC()
 			item := map[string]any{
 				"id":              uuid.NewString(),
 				"backup_id":       backupID,
@@ -452,6 +456,8 @@ func (r *Repository) SetBackupNotifications(ctx context.Context, backupID string
 				"on_success":      binding.OnSuccess,
 				"on_failure":      binding.OnFailure,
 				"enabled":         binding.Enabled,
+				"created_at":      now,
+				"updated_at":      now,
 			}
 
 			if err := tx.Table("backup_notifications").Create(item).Error; err != nil {

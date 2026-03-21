@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"anchordb/internal/models"
+	"anchordb/internal/repository"
 	"anchordb/internal/testutil"
 )
 
@@ -177,6 +178,24 @@ func TestNotificationLifecycleAndBindings(t *testing.T) {
 		t.Fatalf("expected encrypted webhook URL at rest, got %q", stored.DiscordWebhookURL)
 	}
 
+	updated, err := stack.Repo.UpdateNotification(ctx, notification.ID, repository.NotificationPatch{
+		Name: ptrString("discord-alerts-renamed"),
+	})
+	if err != nil {
+		t.Fatalf("update notification: %v", err)
+	}
+	if updated.DiscordWebhookURL != notification.DiscordWebhookURL {
+		t.Fatalf("expected webhook URL to remain decryptable after non-secret update, got %q", updated.DiscordWebhookURL)
+	}
+
+	var storedAfterUpdate models.NotificationDestination
+	if err := stack.DB.WithContext(ctx).First(&storedAfterUpdate, "id = ?", notification.ID).Error; err != nil {
+		t.Fatalf("read stored notification after update: %v", err)
+	}
+	if strings.Count(storedAfterUpdate.DiscordWebhookURL, "enc:v1:") != 1 {
+		t.Fatalf("expected single encryption prefix, got %q", storedAfterUpdate.DiscordWebhookURL)
+	}
+
 	conn := testutil.MustCreateConnection(t, stack.Repo, "notif-source")
 	backup := testutil.MustCreateLocalBackup(t, stack.Repo, "notif-backup", conn.ID, t.TempDir(), true)
 
@@ -191,6 +210,9 @@ func TestNotificationLifecycleAndBindings(t *testing.T) {
 	}
 	if len(bindings) != 1 {
 		t.Fatalf("expected 1 binding, got %d", len(bindings))
+	}
+	if bindings[0].CreatedAt.IsZero() || bindings[0].UpdatedAt.IsZero() {
+		t.Fatalf("expected binding timestamps to be set, got created_at=%v updated_at=%v", bindings[0].CreatedAt, bindings[0].UpdatedAt)
 	}
 
 	successDestinations, err := stack.Repo.ListNotificationDestinationsForEvent(ctx, backup.ID, "success")
@@ -208,4 +230,8 @@ func TestNotificationLifecycleAndBindings(t *testing.T) {
 	if len(failureDestinations) != 0 {
 		t.Fatalf("expected 0 failure destinations, got %d", len(failureDestinations))
 	}
+}
+
+func ptrString(v string) *string {
+	return &v
 }

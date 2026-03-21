@@ -130,7 +130,10 @@ func (d *Dispatcher) sendSMTPMessage(ctx context.Context, destination models.Not
 	if host == "" || port <= 0 {
 		return fmt.Errorf("smtp_host and smtp_port are required")
 	}
-	security := normalizeSMTPSecurity(destination.SMTPSecurity)
+	security, err := normalizeSMTPSecurity(destination.SMTPSecurity)
+	if err != nil {
+		return err
+	}
 
 	from := strings.TrimSpace(destination.SMTPFrom)
 	if from == "" {
@@ -254,17 +257,17 @@ func buildSMTPMessage(from string, to []string, subject, body string) string {
 	return strings.Join(headers, "\r\n") + "\r\n\r\n" + body + "\r\n"
 }
 
-func normalizeSMTPSecurity(raw string) string {
+func normalizeSMTPSecurity(raw string) (string, error) {
 	security := strings.ToLower(strings.TrimSpace(raw))
 	switch security {
 	case "", "starttls":
-		return "starttls"
+		return "starttls", nil
 	case "ssl", "tls", "ssl_tls", "smtps", "implicit_tls", "implicit-tls":
-		return "ssl_tls"
+		return "ssl_tls", nil
 	case "none", "plain", "insecure":
-		return "none"
+		return "none", nil
 	default:
-		return security
+		return "", fmt.Errorf("unsupported smtp_security: %s", strings.TrimSpace(raw))
 	}
 }
 
