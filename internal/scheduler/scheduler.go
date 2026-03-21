@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"anchordb/internal/config"
+	"anchordb/internal/notifications"
 	"anchordb/internal/repository"
 
 	"github.com/robfig/cron/v3"
@@ -15,6 +16,7 @@ import (
 type Scheduler struct {
 	repo     *repository.Repository
 	executor *Executor
+	notifier *notifications.Dispatcher
 	cron     *cron.Cron
 	sem      chan struct{}
 
@@ -26,6 +28,7 @@ func New(repo *repository.Repository, executor *Executor, cfg config.Config) *Sc
 	return &Scheduler{
 		repo:     repo,
 		executor: executor,
+		notifier: notifications.NewDispatcher(repo),
 		cron:     cron.New(),
 		sem:      make(chan struct{}, cfg.MaxConcurrentBackups),
 		entries:  make(map[string]cron.EntryID),
@@ -128,8 +131,16 @@ func (s *Scheduler) executeBackup(backupID string) {
 	outputKey, err := s.executor.Run(ctx, b)
 	if err != nil {
 		log.Printf("backup %s failed: %v", backupID, err)
+		finished := time.Now().UTC()
+		run.Status = "failed"
+		run.ErrorText = err.Error()
+		run.OutputKey = ""
+		run.FinishedAt = &finished
 		if runErr == nil {
 			_ = s.repo.FinishBackupRun(ctx, run.ID, "failed", err.Error(), "")
+		}
+		if notifyErr := s.notifier.NotifyBackupRun(ctx, b, run); notifyErr != nil {
+			log.Printf("backup %s notification failed: %v", backupID, notifyErr)
 		}
 		return
 	}
@@ -143,10 +154,19 @@ func (s *Scheduler) executeBackup(backupID string) {
 	if err := s.repo.TouchBackupRun(ctx, backupID, last, next); err != nil {
 		log.Printf("backup %s update run metadata failed: %v", backupID, err)
 	}
+	finished := time.Now().UTC()
+	run.Status = "success"
+	run.ErrorText = ""
+	run.OutputKey = outputKey
+	run.FinishedAt = &finished
 	if runErr == nil {
 		if err := s.repo.FinishBackupRun(ctx, run.ID, "success", "", outputKey); err != nil {
 			log.Printf("backup %s finish run record failed: %v", backupID, err)
 		}
+	}
+
+	if notifyErr := s.notifier.NotifyBackupRun(ctx, b, run); notifyErr != nil {
+		log.Printf("backup %s notification failed: %v", backupID, notifyErr)
 	}
 
 	log.Printf("backup %s completed", backupID)

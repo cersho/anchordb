@@ -149,3 +149,63 @@ func TestBackupRunLifecycle(t *testing.T) {
 		t.Fatalf("expected 1 run, got %d", len(runs))
 	}
 }
+
+func TestNotificationLifecycleAndBindings(t *testing.T) {
+	stack := testutil.NewStack(t)
+	ctx := context.Background()
+
+	notification := models.NotificationDestination{
+		Name:              "discord-alerts",
+		Type:              "discord",
+		Enabled:           true,
+		DiscordWebhookURL: "https://discord.com/api/webhooks/test-id/test-token",
+	}
+
+	if err := stack.Repo.CreateNotification(ctx, &notification); err != nil {
+		t.Fatalf("create notification: %v", err)
+	}
+
+	if notification.DiscordWebhookURL == "" {
+		t.Fatal("expected decrypted webhook URL in create response")
+	}
+
+	var stored models.NotificationDestination
+	if err := stack.DB.WithContext(ctx).First(&stored, "id = ?", notification.ID).Error; err != nil {
+		t.Fatalf("read stored notification: %v", err)
+	}
+	if !strings.HasPrefix(stored.DiscordWebhookURL, "enc:v1:") {
+		t.Fatalf("expected encrypted webhook URL at rest, got %q", stored.DiscordWebhookURL)
+	}
+
+	conn := testutil.MustCreateConnection(t, stack.Repo, "notif-source")
+	backup := testutil.MustCreateLocalBackup(t, stack.Repo, "notif-backup", conn.ID, t.TempDir(), true)
+
+	bindings, err := stack.Repo.SetBackupNotifications(ctx, backup.ID, []models.BackupNotification{{
+		NotificationID: notification.ID,
+		Enabled:        true,
+		OnSuccess:      true,
+		OnFailure:      false,
+	}})
+	if err != nil {
+		t.Fatalf("set backup notifications: %v", err)
+	}
+	if len(bindings) != 1 {
+		t.Fatalf("expected 1 binding, got %d", len(bindings))
+	}
+
+	successDestinations, err := stack.Repo.ListNotificationDestinationsForEvent(ctx, backup.ID, "success")
+	if err != nil {
+		t.Fatalf("list success destinations: %v", err)
+	}
+	if len(successDestinations) != 1 {
+		t.Fatalf("expected 1 success destination, got %d", len(successDestinations))
+	}
+
+	failureDestinations, err := stack.Repo.ListNotificationDestinationsForEvent(ctx, backup.ID, "failed")
+	if err != nil {
+		t.Fatalf("list failure destinations: %v", err)
+	}
+	if len(failureDestinations) != 0 {
+		t.Fatalf("expected 0 failure destinations, got %d", len(failureDestinations))
+	}
+}
